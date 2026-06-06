@@ -351,6 +351,7 @@ void susfs_set_priv_app_sid(void)
 #include <linux/slab.h>
 #include "policy/feature.h"
 #include "include/ksu.h"
+#include  "uapi/feature.h"
 
 static DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);
 static struct page *fake_status = NULL;
