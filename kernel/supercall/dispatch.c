@@ -4,6 +4,7 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <linux/thread_info.h>
 #ifdef CONFIG_KSU_SUSFS
 #include <linux/namei.h>
 #include <linux/susfs.h>
@@ -795,6 +796,12 @@ out:
 	return err;
 }
 
+static int do_disable_escape_to_root(void __user *arg)
+{
+    set_thread_flag(TIF_KSU_DISABLE_ESCAPE_WITH_ROOT);
+    return 0;
+}
+
 // IOCTL handlers mapping table
 // clang-format off
 static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
@@ -929,6 +936,12 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
         .name = "SET_INIT_PGRP",
         .handler = do_set_init_pgrp,
         .perm_check = only_root
+    },
+    { 
+        .cmd = KSU_IOCTL_DISABLE_ESCAPE_TO_ROOT, 
+        .name = "DISABLE_ESCAPE_TO_ROOT", 
+        .handler = do_disable_escape_to_root, 
+        .perm_check = only_root 
     },
     {
         .cmd = KSU_IOCTL_GET_HOOK_MODE,
