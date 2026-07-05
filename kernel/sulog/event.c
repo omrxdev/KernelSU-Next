@@ -8,6 +8,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/ktime.h>
 
 #include "feature/sulog.h"
 #include "infra/event_queue.h"
@@ -45,13 +46,18 @@ static struct compat_sulog_entry compat_sulog_buf[COMPAT_SULOG_MAX];
 static uint8_t compat_sulog_idx = 0;
 static DEFINE_SPINLOCK(compat_sulog_lock);
 
+static inline void ksu_get_boottime_ts64(struct timespec64 *ts)
+{
+    *ts = ktime_to_timespec64(ktime_get_boottime());
+}
+
 void ksu_compat_sulog(uint8_t sym)
 {
     struct compat_sulog_entry entry = {0};
     unsigned int uid = current_uid().val;
     struct timespec64 ts;
 
-    ktime_get_boottime_ts64(&ts);
+    ksu_get_boottime_ts64(&ts);
     entry.s_time = (uint32_t)ts.tv_sec;
     entry.data = (uint32_t)uid;
     memcpy((void *)&entry.data + 3, &sym, 1);
@@ -82,7 +88,7 @@ int ksu_sulog_handle_compat_dump(void __user *uptr)
     if (!sbuf.index_ptr || !sbuf.buf_ptr || !sbuf.uptime_ptr)
         return 1;
 
-    ktime_get_boottime_ts64(&ts);
+    ksu_get_boottime_ts64(&ts);
     uptime = (uint32_t)ts.tv_sec;
     if (copy_to_user((void __user *)(uintptr_t)sbuf.uptime_ptr, &uptime, sizeof(uptime)))
         return 1;
