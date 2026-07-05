@@ -6,6 +6,8 @@
 
 #include "ss/policydb.h"
 
+#define KSU_SELINUX_POLICYLOAD_SEQNO 1U
+
 int ksu_dup_policydb(struct policydb *old_db, struct policydb *new_db);
 void policydb_destroy(struct policydb *db);
 

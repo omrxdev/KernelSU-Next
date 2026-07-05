@@ -4,6 +4,7 @@
 #include <linux/types.h>
 #include <linux/version.h>
 #include <linux/lockdep.h>
+#include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/rwlock.h>
@@ -28,6 +29,52 @@ struct sidtab *backup_sidtab;
 
 #define ALL NULL
 
+static const char * const ksu_guarded_app_sources[] = {
+    "untrusted_app",
+    "untrusted_app_25",
+    "untrusted_app_27",
+    "untrusted_app_29",
+    "untrusted_app_30",
+    "untrusted_app_32",
+    "untrusted_app_33",
+    "untrusted_app_34",
+    "ephemeral_app",
+    "isolated_app",
+    "isolated_compute_app",
+    "app_zygote",
+    "sdk_sandbox",
+};
+
+static void ksu_guardrail_deny_execmem(struct policydb *db)
+{
+    size_t i;
+
+    if (!ksu_exists(db, "system_server")) return;
+
+    for (i = 0; i < ARRAY_SIZE(ksu_guarded_app_sources); i++) {
+        const char *source_type = ksu_guarded_app_sources[i];
+
+        if (!ksu_exists(db, source_type)) continue;
+        ksu_deny(db, source_type, "system_server", "process", "execmem");
+    }
+}
+
+static void ksu_apply_policy_guardrails(struct policydb *db)
+{
+    if (ksu_exists(db, "fsck_untrusted") && ksu_exists(db, "sysadmin")) {
+        ksu_deny(db, "fsck_untrusted", "sysadmin", ALL, ALL);
+    }
+    if (ksu_exists(db, "fsck_untrusted")) {
+        ksu_deny(db, "fsck_untrusted", "fsck_untrusted", "capability",
+                 "sys_admin");
+    }
+    if (ksu_exists(db, "adbd") && ksu_exists(db, "adbroot")) {
+        ksu_deny(db, "adbd", "adbroot", "binder", "call");
+    }
+
+    ksu_guardrail_deny_execmem(db);
+}
+
 #if ((!defined(KSU_COMPAT_USE_SELINUX_STATE)) || LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
 extern int avc_ss_reset(u32 seqno);
 #else
@@ -37,14 +84,15 @@ extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
 static void reset_avc_cache()
 {
 #if (!defined(KSU_COMPAT_USE_SELINUX_STATE) || LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
-    avc_ss_reset(0);
-    selnl_notify_policyload(0);
-    selinux_status_update_policyload(0);
+    avc_ss_reset(KSU_SELINUX_POLICYLOAD_SEQNO);
+    selnl_notify_policyload(KSU_SELINUX_POLICYLOAD_SEQNO);
+    selinux_status_update_policyload(KSU_SELINUX_POLICYLOAD_SEQNO);
 #else
     struct selinux_avc *avc = selinux_state.avc;
-    avc_ss_reset(avc, 0);
-    selnl_notify_policyload(0);
-    selinux_status_update_policyload(&selinux_state, 0);
+    avc_ss_reset(avc, KSU_SELINUX_POLICYLOAD_SEQNO);
+    selnl_notify_policyload(KSU_SELINUX_POLICYLOAD_SEQNO);
+    selinux_status_update_policyload(&selinux_state,
+                                     KSU_SELINUX_POLICYLOAD_SEQNO);
 #endif
     selinux_xfrm_notify_policyload();
 }
@@ -245,7 +293,9 @@ void apply_kernelsu_rules()
     // Create unconstrained file type
     ksu_type(db, KERNEL_SU_FILE, "file_type");
     ksu_typeattribute(db, KERNEL_SU_FILE, "mlstrustedobject");
-    ksu_allow(db, "domain", KERNEL_SU_FILE, ALL, ALL);
+    ksu_allow(db, KERNEL_SU_DOMAIN, KERNEL_SU_FILE, ALL, ALL);
+    // init must still be able to exec /data/adb/ksud during boot events.
+    ksu_allow(db, "init", KERNEL_SU_FILE, "file", ALL);
 
     // allow all!
     ksu_allow(db, KERNEL_SU_DOMAIN, ALL, ALL, ALL);
@@ -307,6 +357,8 @@ void apply_kernelsu_rules()
     // Allow system server kill su process
     ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
     ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
+
+    ksu_apply_policy_guardrails(db);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_POLICY_MUTEX)
     rcu_assign_pointer(selinux_state.policy, pol);
@@ -713,6 +765,8 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
         }
         cmd_index++;
     }
+
+    ksu_apply_policy_guardrails(db);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_POLICY_MUTEX)
     // 5.10+

@@ -7,6 +7,7 @@
 #include <linux/memory.h>
 #include <linux/uaccess.h>
 #include <linux/init.h>
+#include <linux/kernel.h>
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/fs.h>
@@ -126,6 +127,184 @@ static write_op_fn orig_context_write, orig_access_write;
 
 static struct page *fake_status = NULL;
 
+static struct policydb *ksu_hide_policydb(void)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+    return backup_sepolicy ? &backup_sepolicy->policydb : NULL;
+#elif defined(KSU_COMPAT_USE_SELINUX_STATE)
+    return fake_state.ss ? &fake_state.ss->policydb : NULL;
+#else
+    return backup_policydb;
+#endif
+}
+
+static const char *ksu_context_type(const char *ctx, size_t *type_len)
+{
+    const char *type;
+    const char *end;
+
+    if (!ctx) return NULL;
+
+    type = strchr(ctx, ':');
+    if (!type) return NULL;
+    type = strchr(type + 1, ':');
+    if (!type) return NULL;
+    type++;
+
+    end = strchr(type, ':');
+    if (!end) return NULL;
+
+    *type_len = (size_t)(end - type);
+    return type;
+}
+
+static bool ksu_context_type_is(const char *ctx, const char *type_name)
+{
+    size_t type_len;
+    const char *type = ksu_context_type(ctx, &type_len);
+
+    return type && strlen(type_name) == type_len &&
+           !strncmp(type, type_name, type_len);
+}
+
+static bool ksu_context_type_has_prefix(const char *ctx,
+                                        const char *type_prefix)
+{
+    size_t type_len;
+    size_t prefix_len = strlen(type_prefix);
+    const char *type = ksu_context_type(ctx, &type_len);
+
+    return type && type_len >= prefix_len &&
+           !strncmp(type, type_prefix, prefix_len);
+}
+
+static bool ksu_context_type_is_any(const char *ctx, const char * const *types,
+                                    size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        if (ksu_context_type_is(ctx, types[i])) return true;
+    }
+
+    return false;
+}
+
+static bool ksu_hide_class_is(struct policydb *db, u16 tclass,
+                              const char *class_name)
+{
+    struct class_datum *cls;
+
+    if (!db) return false;
+
+    cls = ksu_symtab_search(&db->p_classes, class_name);
+    return cls && cls->value == tclass;
+}
+
+static u32 ksu_hide_perm_mask(struct policydb *db, const char *class_name,
+                              const char *perm_name)
+{
+    struct class_datum *cls;
+    struct perm_datum *perm;
+
+    if (!db) return 0;
+
+    cls = ksu_symtab_search(&db->p_classes, class_name);
+    if (!cls) return 0;
+
+    perm = ksu_symtab_search(&cls->permissions, perm_name);
+    if (!perm && cls->comdatum) {
+        perm = ksu_symtab_search(&cls->comdatum->permissions, perm_name);
+    }
+    if (!perm || !perm->value || perm->value > 32) return 0;
+
+    return 1U << (perm->value - 1);
+}
+
+static void ksu_hide_clear_perm(struct av_decision *avd, const char *scon,
+                                const char *tcon, u16 tclass,
+                                const char *src_type_prefix,
+                                const char *target_type,
+                                const char *class_name,
+                                const char *perm_name)
+{
+    u32 perm;
+    struct policydb *db = ksu_hide_policydb();
+
+    if (!ksu_context_type_has_prefix(scon, src_type_prefix)) return;
+    if (!ksu_context_type_is(tcon, target_type)) return;
+    if (!ksu_hide_class_is(db, tclass, class_name)) return;
+
+    perm = ksu_hide_perm_mask(db, class_name, perm_name);
+    avd->allowed &= ~perm;
+}
+
+static void ksu_hide_clear_perm_for_sources(struct av_decision *avd,
+                                            const char *scon,
+                                            const char *tcon, u16 tclass,
+                                            const char * const *source_types,
+                                            size_t source_type_count,
+                                            const char *target_type,
+                                            const char *class_name,
+                                            const char *perm_name)
+{
+    u32 perm;
+    struct policydb *db = ksu_hide_policydb();
+
+    if (!ksu_context_type_is_any(scon, source_types, source_type_count)) {
+        return;
+    }
+    if (!ksu_context_type_is(tcon, target_type)) return;
+    if (!ksu_hide_class_is(db, tclass, class_name)) return;
+
+    perm = ksu_hide_perm_mask(db, class_name, perm_name);
+    avd->allowed &= ~perm;
+}
+
+static void ksu_hide_filter_access_decision(struct av_decision *avd,
+                                            const char *scon,
+                                            const char *tcon, u16 tclass)
+{
+    static const char * const app_query_sources[] = {
+        "untrusted_app",
+        "untrusted_app_25",
+        "untrusted_app_27",
+        "untrusted_app_29",
+        "untrusted_app_30",
+        "untrusted_app_32",
+        "untrusted_app_33",
+        "untrusted_app_34",
+        "ephemeral_app",
+        "isolated_app",
+        "isolated_compute_app",
+        "app_zygote",
+        "sdk_sandbox",
+    };
+
+    if (ksu_context_type_is(scon, "fsck_untrusted") &&
+        ksu_context_type_is(tcon, "sysadmin")) {
+        avd->allowed = 0;
+        return;
+    }
+    ksu_hide_clear_perm(avd, scon, tcon, tclass, "fsck_untrusted",
+                        "fsck_untrusted", "capability", "sys_admin");
+    ksu_hide_clear_perm(avd, scon, tcon, tclass, "adbd",
+                        "adbroot", "binder", "call");
+
+    ksu_hide_clear_perm_for_sources(avd, scon, tcon, tclass,
+                                    app_query_sources,
+                                    ARRAY_SIZE(app_query_sources),
+                                    "system_server", "process", "execmem");
+    ksu_hide_clear_perm_for_sources(avd, scon, tcon, tclass,
+                                    app_query_sources,
+                                    ARRAY_SIZE(app_query_sources),
+                                    "ksu_file", "file", "read");
+    ksu_hide_clear_perm_for_sources(avd, scon, tcon, tclass,
+                                    app_query_sources,
+                                    ARRAY_SIZE(app_query_sources),
+                                    "lsposed_file", "file", "read");
+}
+
 static void initialize_fake_status(void)
 {
     struct mutex *status_lock = ksu_get_status_lock();
@@ -144,10 +323,12 @@ static void initialize_fake_status(void)
 
     struct selinux_kernel_status *new_status = page_address(new_page);
     memcpy(new_status, status, sizeof(*status));
-    
+
+    new_status->policyload = KSU_SELINUX_POLICYLOAD_SEQNO;
+    new_status->sequence = 4;
+
     if (ksu_late_loaded && !new_status->enforcing) {
         new_status->enforcing = 1;
-        new_status->sequence = new_status->policyload ? 4 : 0;
     }
 
     fake_status = new_page;
@@ -163,12 +344,16 @@ static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
     if (likely(current_uid().val >= 10000 && ksu_selinux_hide_enabled)) {
         struct mutex *status_lock = ksu_get_status_lock();
         void *data;
-        
+
+        if (!fake_status) {
+            initialize_fake_status();
+        }
+
         if (status_lock) {
             mutex_lock(status_lock);
             data = fake_status;
             mutex_unlock(status_lock);
-            
+
             if (data) {
                 filp->private_data = data;
                 return 0;
@@ -304,6 +489,9 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
     if (length) goto out;
     ksu_security_compute_av_user(ssid, tsid, tclass, &avd);
 #endif
+
+    ksu_hide_filter_access_decision(&avd, scon, tcon, tclass);
+    avd.seqno = KSU_SELINUX_POLICYLOAD_SEQNO;
 
     length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%x %x %x %x %u %x", 
                        avd.allowed, 0xffffffff, avd.auditallow, avd.auditdeny, avd.seqno, avd.flags);
@@ -445,7 +633,7 @@ static int ksu_selinux_hide_enable(void)
     fake_state.ss->sidtab = kzalloc(sizeof(struct sidtab), GFP_KERNEL);
     if (!fake_state.ss->sidtab) { kfree(fake_state.ss); return -ENOMEM; }
     
-    fake_state.ss->latest_granting = 1;
+    fake_state.ss->latest_granting = KSU_SELINUX_POLICYLOAD_SEQNO;
     rwlock_init(&(fake_state.ss->policy_rwlock));
     memcpy(&fake_state.ss->policydb, backup_policydb, sizeof(struct policydb));
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
