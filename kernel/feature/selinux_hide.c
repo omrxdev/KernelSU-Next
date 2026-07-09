@@ -15,8 +15,9 @@
 
 static struct page *fake_status = NULL;
 static DEFINE_MUTEX(fake_status_init_mutex);
-
+#ifndef KSU_KPROBES_HOOK
 extern bool ksu_input_hook __read_mostly;
+#endif
 extern struct selinux_state selinux_state;
 
 // enabled by default
@@ -246,8 +247,10 @@ static int ksu_hide_init_thread(void *data)
 {
 	set_user_nice(current, 19);
 
+	#ifndef KSU_KPROBES_HOOK
 	while (READ_ONCE(ksu_input_hook))
 		msleep(5000);
+#endif
 
 	if (ksu_selinux_hide_is_enabled)
 		ksu_selinux_hide_enable();
