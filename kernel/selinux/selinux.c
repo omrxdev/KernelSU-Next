@@ -1,10 +1,12 @@
 #include "selinux.h"
 #include "linux/cred.h"
 #include "linux/sched.h"
+#include "linux/security.h"
 #include "objsec.h"
 #include "linux/version.h"
 #include "klog.h" // IWYU pragma: keep
 #include "ksu.h"
+#include "compat/kernel_compat.h"
 
 /*
  * Cached SID values for frequently checked contexts.
@@ -72,22 +74,36 @@ void setup_ksu_cred(void)
 void setenforce(bool enforce)
 {
 #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
-    selinux_state.enforcing = enforce;
+#ifdef KSU_COMPAT_USE_SELINUX_STATE
+	selinux_state.enforcing = enforce;
+#else
+	selinux_enforcing = enforce;
+#endif
 #endif
 }
 
 bool getenforce(void)
 {
 #ifdef CONFIG_SECURITY_SELINUX_DISABLE
-    if (selinux_state.disabled) {
-        return false;
-    }
-#endif
+#ifdef KSU_COMPAT_USE_SELINUX_STATE
+	if (selinux_state.disabled) {
+		return false;
+	}
+#else
+	if (selinux_disabled) {
+		return false;
+	}
+#endif // KSU_COMPAT_USE_SELINUX_STATE
+#endif // CONFIG_SECURITY_SELINUX_DISABLE
 
 #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
-    return selinux_state.enforcing;
+#ifdef KSU_COMPAT_USE_SELINUX_STATE
+	return selinux_state.enforcing;
 #else
-    return true;
+	return selinux_enforcing;
+#endif
+#else
+	return true;
 #endif
 }
 

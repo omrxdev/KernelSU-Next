@@ -1,21 +1,32 @@
 kernelsu-objs := core/init.o
 
+kernelsu-objs += compat/kernel_compat.o
+
 kernelsu-objs += feature/kernel_umount.o
 kernelsu-objs += feature/sulog.o
 kernelsu-objs += feature/sucompat.o
 
-kernelsu-objs += hook/lsm_hook.o
 kernelsu-objs += hook/setuid_hook.o
+ifeq ($(CONFIG_ARM64),y)
+kernelsu-objs += hook/arm64/patch_memory.o
+else ifeq ($(CONFIG_X86_64),y)
+kernelsu-objs += hook/x86_64/patch_memory.o
+endif
+
+ifeq ($(CONFIG_KSU_KPROBES_HOOK),y)
+kernelsu-objs += hook/lsm_hook.o
 kernelsu-objs += hook/syscall_event_bridge.o
 kernelsu-objs += hook/syscall_hook_manager.o
 kernelsu-objs += hook/tp_marker.o
 ifeq ($(CONFIG_ARM64),y)
-kernelsu-objs += hook/arm64/patch_memory.o
 kernelsu-objs += hook/arm64/syscall_hook.o
 else ifeq ($(CONFIG_X86_64),y)
-kernelsu-objs += hook/x86_64/patch_memory.o
 kernelsu-objs += hook/x86_64/syscall_hook.o
 endif
+else
+kernelsu-objs += hook/lsm_hook_manual.o
+endif
+
 kernelsu-objs += extras.o
 
 kernelsu-objs += infra/file_wrapper.o
@@ -122,6 +133,99 @@ endif
 
 KSU_NEW_DCACHE_FLUSH := $(shell grep -q __flush_dcache_area $(srctree)/arch/arm64/include/asm/cacheflush.h ; echo $$?)
 $(info -- KernelSU-Next new DCACHE flush: $(KSU_NEW_DCACHE_FLUSH))
+
+# SELinux drivers check
+ifeq ($(shell grep -q "current_sid(void)" $(srctree)/security/selinux/include/objsec.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_HAS_CURRENT_SID
+endif
+ifeq ($(shell grep -q "struct selinux_state " $(srctree)/security/selinux/include/security.h; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: selinux_state found)
+ccflags-y += -DKSU_COMPAT_USE_SELINUX_STATE
+endif
+
+# Handle optional backports
+ifeq ($(shell grep -q "strncpy_from_user_nofault" $(srctree)/include/linux/uaccess.h; echo $$?),0)
+ccflags-y += -DKSU_OPTIONAL_STRNCPY
+endif
+
+ifeq ($(shell grep -q "ssize_t kernel_read" $(srctree)/fs/read_write.c; echo $$?),0)
+ccflags-y += -DKSU_OPTIONAL_KERNEL_READ
+endif
+
+ifeq ($(shell grep "ssize_t kernel_write" $(srctree)/fs/read_write.c | grep -q "const void" ; echo $$?),0)
+ccflags-y += -DKSU_OPTIONAL_KERNEL_WRITE
+endif
+
+ifeq ($(shell grep -q "int\s\+path_umount" $(srctree)/fs/namespace.c; echo $$?),0)
+ccflags-y += -DKSU_HAS_PATH_UMOUNT
+endif
+
+# seccomp_types.h was added in 6.7
+ifeq ($(shell grep -q "atomic_t\s\+filter_count" $(srctree)/include/linux/seccomp.h $(srctree)/include/linux/seccomp_types.h; echo $$?),0)
+ccflags-y += -DKSU_OPTIONAL_SECCOMP_FILTER_CNT
+endif
+
+# some old kernels backport this, so check whether put_seccomp_filter still exists
+ifneq ($(shell grep -wq "put_seccomp_filter" $(srctree)/kernel/seccomp.c $(srctree)/include/linux/seccomp.h; echo $$?),0)
+ccflags-y += -DKSU_OPTIONAL_SECCOMP_FILTER_RELEASE
+endif
+
+# Checks Samsung
+ifeq ($(shell grep -q "CONFIG_KDP_CRED" $(srctree)/kernel/cred.c; echo $$?),0)
+ccflags-y += -DSAMSUNG_UH_DRIVER_EXIST
+endif
+
+ifeq ($(shell grep -q "SEC_SELINUX_PORTING_COMMON" $(srctree)/security/selinux/avc.c; echo $$?),0)
+ccflags-y += -DSAMSUNG_SELINUX_PORTING
+endif
+
+# policy mutex
+# kernel 5.10+
+ifeq ($(shell grep -q "policy_mutex" $(srctree)/security/selinux/include/security.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_HAS_POLICY_MUTEX
+endif
+
+# Android SPEC Changes
+# https://android-review.googlesource.com/c/kernel/common/+/3009995
+ifeq ($(shell grep -q "POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE" $(srctree)/security/selinux/ss/policydb.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_HAS_POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE
+endif
+
+ifeq ($(shell grep -q "POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH" $(srctree)/security/selinux/ss/policydb.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_HAS_POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH
+endif
+
+ifneq ($(shell grep -q "flex_array" $(srctree)/security/selinux/ss/policydb.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_HAS_MODERN_POLICYDB
+endif
+
+ifeq ($(shell grep -F -q "int (*setprocattr)(const char *name, void *value, size_t size);" $(srctree)/include/linux/lsm_hooks.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_SETPROCATTR_USE_NEW_PROTOTYPE
+endif
+
+ifeq ($(shell grep -F -q "char *lsm_names" $(srctree)/security/security.c; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_REQUIRE_PROVIDE_LSM_NAME
+endif
+
+# https://github.com/torvalds/linux/commit/4b36cb773a8153417a080f8025d522322f915aea
+ifeq ($(shell grep -q "struct mutex status_lock" $(srctree)/security/selinux/include/security.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_SELINUX_STATUS_VAR_IN_SELINUX_STATE
+endif
+
+ifeq ($(shell grep -q "struct selinux_policy" $(srctree)/security/selinux/ss/services.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_HAS_SELINUX_POLICY_STRUCT
+endif
+
+# https://github.com/torvalds/linux/commit/24def7bb92c19337cee26d506f87dc4eeeba7a19
+ifeq ($(shell grep -q "hashtab_key_params" $(srctree)/security/selinux/ss/hashtab.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_HAS_HASHTAB_KEY_PARAMS
+endif
+
+# https://github.com/torvalds/linux/commit/c3a276111ea2572399281988b3129683e2a6b60b
+ifeq ($(shell grep -q "filename_trans_key" $(srctree)/security/selinux/ss/policydb.h; echo $$?),0)
+ccflags-y += -DKSU_COMPAT_HAS_FILENAME_TRANS_KEY
+endif
+
 
 ifndef KSU_NEXT_MANAGER_SIZE
 KSU_NEXT_MANAGER_SIZE := 0x3e6

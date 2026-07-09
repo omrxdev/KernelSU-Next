@@ -5,6 +5,13 @@
 #include <linux/version.h>
 #include <linux/cred.h>
 
+#include "objsec.h"
+#include "security.h" // Samsung SELinux Porting
+
+#ifndef KSU_COMPAT_USE_SELINUX_STATE
+#include "avc.h"
+#endif
+
 #define KERNEL_SU_DOMAIN "ksu"
 #define KERNEL_SU_FILE "ksu_file"
 
@@ -12,6 +19,18 @@
 #define KSU_FILE_CONTEXT "u:object_r:" KERNEL_SU_FILE ":s0"
 #define ZYGOTE_CONTEXT "u:r:zygote:s0"
 #define INIT_CONTEXT "u:r:init:s0"
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)) && !defined(KSU_COMPAT_HAS_CURRENT_SID)
+/*
+ * get the subjective security ID of the current task
+ */
+static inline u32 current_sid(void)
+{
+    const struct task_security_struct *tsec = current_security();
+
+    return tsec->sid;
+}
+#endif
 
 void setup_selinux(const char *, struct cred *);
 

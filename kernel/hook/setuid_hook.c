@@ -21,16 +21,21 @@
 #include "hook/tp_marker.h"
 #include "feature/kernel_umount.h"
 
+extern void disable_seccomp();
+
 int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)
 {
     // we rely on the fact that zygote always call setresuid(3) with same uids
 
     pr_info("handle_setresuid from %d to %d\n", old_uid, new_uid);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
     if (unlikely(is_uid_manager(new_uid))) {
         spin_lock_irq(&current->sighand->siglock);
         ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
+#ifdef CONFIG_KSU_KPROBES_HOOK
         ksu_set_task_tracepoint_flag(current);
+#endif
         spin_unlock_irq(&current->sighand->siglock);
 
         pr_info("install fd for manager: %d\n", new_uid);
@@ -45,10 +50,28 @@ int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)
             ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
             spin_unlock_irq(&current->sighand->siglock);
         }
+#ifdef CONFIG_KSU_KPROBES_HOOK
         ksu_set_task_tracepoint_flag(current);
-    } else {
+#endif
+    }
+#ifdef CONFIG_KSU_KPROBES_HOOK
+    else {
         ksu_clear_task_tracepoint_flag_if_needed(current);
     }
+#endif
+
+#else // #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    if (ksu_is_allow_uid_for_current(new_uid)) {
+        disable_seccomp();
+
+        if (unlikely(is_uid_manager(new_uid))) {
+            pr_info("install fd for ksu manager(uid=%d)\n", new_uid);
+            ksu_install_fd();
+        }
+
+        return 0;
+    }
+#endif // #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
 
     // Handle kernel umount
     ksu_handle_umount(old_uid, new_uid);

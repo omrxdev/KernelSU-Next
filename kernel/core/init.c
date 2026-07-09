@@ -12,15 +12,19 @@
 #include "klog.h" // IWYU pragma: keep
 #include "manager/manager_observer.h"
 #include "manager/throne_tracker.h"
+#ifdef CONFIG_KSU_KPROBES_HOOK
 #include "hook/syscall_hook_manager.h"
+#include "hook/syscall_hook.h"
 #include "hook/lsm_hook.h"
+#else
+#include "hook/lsm_hook_manual.h"
+#endif
 #include "runtime/ksud.h"
 #include "runtime/ksud_boot.h"
 #include "supercall/supercall.h"
 #include "ksu.h"
 #include "infra/file_wrapper.h"
 #include "selinux/selinux.h"
-#include "hook/syscall_hook.h"
 #include "feature/adb_root.h"
 #include "feature/selinux_hide.h"
 #include "feature/sulog.h"
@@ -128,7 +132,9 @@ int __init kernelsu_init(void)
 	}
 
 	ksu_init_symbol_resolver();
+#ifdef CONFIG_KSU_KPROBES_HOOK
 	ksu_syscall_hook_init();
+#endif
 
 	ksu_feature_init();
 
@@ -136,7 +142,11 @@ int __init kernelsu_init(void)
 
 	ksu_adb_root_init();
 
+#ifdef CONFIG_KSU_KPROBES_HOOK
 	ksu_lsm_hook_init();
+#else
+	ksu_lsm_hook_built_in_init();
+#endif
 
 	ksu_selinux_hide_init();
 
@@ -157,7 +167,9 @@ int __init kernelsu_init(void)
 		ksu_allowlist_init();
 		ksu_load_allow_list();
 
+#ifdef CONFIG_KSU_KPROBES_HOOK
 		ksu_syscall_hook_manager_init();
+#endif
 
 		ksu_throne_tracker_init();
 		ksu_observer_init();
@@ -172,7 +184,9 @@ int __init kernelsu_init(void)
 		}
 
 	} else {
+#ifdef CONFIG_KSU_KPROBES_HOOK
 		ksu_syscall_hook_manager_init();
+#endif
 
 		ksu_allowlist_init();
 
@@ -193,8 +207,10 @@ int __init kernelsu_init(void)
 
 void __exit kernelsu_exit(void)
 {
+#ifdef CONFIG_KSU_KPROBES_HOOK
 	// Phase 1: Stop all hooks first to prevent new callbacks
 	ksu_syscall_hook_manager_exit();
+#endif
 
 	ksu_supercalls_exit();
 
@@ -213,7 +229,9 @@ void __exit kernelsu_exit(void)
 
 	ksu_selinux_hide_exit();
 
+#ifdef CONFIG_KSU_KPROBES_HOOK
 	ksu_lsm_hook_exit();
+#endif
 
 	ksu_adb_root_exit();
 
