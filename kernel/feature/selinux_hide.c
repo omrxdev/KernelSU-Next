@@ -10,14 +10,16 @@
 #include "policy/feature.h"
 #include "include/ksu.h"
 #include  "uapi/feature.h"
+#include  "uapi/selinux.h"
 #include "selinux/selinux.h"
 #include "feature/selinux_hide.h"
+#include "compat/kernel_compat.h"
 
-static struct page *fake_status = NULL;
-static DEFINE_MUTEX(fake_status_init_mutex);
 #ifndef KSU_KPROBES_HOOK
 extern bool ksu_input_hook __read_mostly;
 #endif
+static struct page *fake_status = NULL;
+static DEFINE_MUTEX(fake_status_init_mutex);
 extern struct selinux_state selinux_state;
 
 // enabled by default
@@ -36,6 +38,260 @@ static int ksu_selinux_get_sids(void)
 	return (!ksu_sid || !priv_app_sid) ? -1 : 0;
 }
 
+void ksu_slow_avc_audit(u32 *tsid)
+{
+	if (unlikely(!ksu_selinux_hide_is_enabled))
+		return;
+
+	if (*tsid != ksu_sid)
+		return;
+
+	pr_info("selinux_hide: slow_avc_audit: replace tsid: %u with priv_app_sid: %u\n", *tsid, priv_app_sid);
+	*tsid = priv_app_sid;
+
+	return;
+}
+
+char *ksu_hide_type_list __read_mostly = NULL;
+size_t ksu_hide_type_len = 0;
+char *ksu_hide_rule_list __read_mostly = NULL;
+size_t ksu_hide_rule_len = 0;
+DEFINE_MUTEX(selinux_hide_list_mutex);
+
+static inline bool ksu_should_destroy_context(char *str)
+{
+	if (!str)
+		return false;
+
+	bool status = false;
+
+	mutex_lock(&selinux_hide_list_mutex);
+
+	size_t offset = 0;
+	while (offset < ksu_hide_type_len) {
+		const char *current_entry = ksu_hide_type_list + offset;
+		
+		if (strstr(str, current_entry)) {
+			status = true;
+			goto out_unlock;
+		}
+
+		offset = offset + strlen(current_entry) + 1;
+	}
+	// double strstr
+	char *str2 = strchr(str, ' ');
+	if (!str2)
+		goto out_unlock;
+
+	offset = 0;
+	while (offset < ksu_hide_rule_len) {
+		const char *src_rule = ksu_hide_rule_list + offset;
+		size_t src_sz = strlen(src_rule) + 1;
+			
+		const char *tgt_rule = src_rule + src_sz;
+		size_t tgt_sz = strlen(tgt_rule) + 1;
+
+		if (strstr(str, src_rule) && strstr(str2, tgt_rule)) {
+			status = true;
+			goto out_unlock;
+		}
+
+		offset = offset + src_sz + tgt_sz;
+	}
+
+out_unlock:
+	mutex_unlock(&selinux_hide_list_mutex);
+	return status;
+}
+
+void ksu_add_probe_to_list(u32 cmd, const char *args[])
+{
+	if (!args || !args[0])
+		return;
+
+	mutex_lock(&selinux_hide_list_mutex);
+
+	int argc = sepol_expected_argc(cmd);
+
+	if (cmd == KSU_SEPOLICY_CMD_TYPE || cmd == KSU_SEPOLICY_CMD_TYPE_ATTR || cmd == KSU_SEPOLICY_CMD_TYPE_STATE || cmd == KSU_SEPOLICY_CMD_ATTR) {
+		
+		const char *name = args[0];
+		size_t needed_len = strlen(name) + 3; // :type:\0
+
+		if (!ksu_hide_type_list)
+			goto skip_type_dup_check;
+
+		// anti duplicate
+		size_t offset = 0;
+		while (offset < ksu_hide_type_len) {
+			const char *current_type = ksu_hide_type_list + offset;
+
+			char tmp_buf[64];
+			snprintf(tmp_buf, sizeof(tmp_buf), ":%s:", name);
+
+			if (!strcmp(current_type, tmp_buf))
+				goto out_unlock;
+
+			offset = offset + strlen(current_type) + 1;
+		}
+
+	skip_type_dup_check:
+		;
+		size_t new_total_len = ksu_hide_type_len + needed_len;
+
+		char *new_ptr = krealloc(ksu_hide_type_list, new_total_len, GFP_KERNEL);
+		if (!new_ptr)
+			goto out_unlock;
+
+		ksu_hide_type_list = new_ptr;
+
+		char *w_ptr = ksu_hide_type_list + ksu_hide_type_len;
+		sprintf(w_ptr, ":%s:", name);
+
+		ksu_hide_type_len = new_total_len;
+
+		pr_info("selinux_hide: tracking type: %s\n", w_ptr );
+
+
+	} else if (argc >= 2) {
+
+		if (!args[1])
+			goto out_unlock;
+
+		const char *src = args[0];
+		const char *tgt = args[1];
+
+		size_t src_needed = strlen(src) + 3; // :src:\0
+		size_t tgt_needed = strlen(tgt) + 3; // :tgt:\0
+		size_t needed_len = src_needed + tgt_needed;
+
+		if (!ksu_hide_rule_list)
+			goto skip_rule_dup_check;
+
+		// anti duplicate
+		size_t offset = 0;
+		while (offset < ksu_hide_rule_len) {
+			const char *src_chk = ksu_hide_rule_list + offset;
+			size_t src_sz = strlen(src_chk) + 1; // for \0			
+
+			const char *tgt_chk = src_chk + src_sz;
+			size_t tgt_sz = strlen(tgt_chk) + 1; // for \0
+
+			char src_buf[64], tgt_buf[64];
+			snprintf(src_buf, sizeof(src_buf), ":%s:", src);
+			snprintf(tgt_buf, sizeof(tgt_buf), ":%s:", tgt);
+
+			if (!strcmp(src_chk, src_buf) && !strcmp(tgt_chk, tgt_buf))
+				goto out_unlock;
+
+			offset = offset + src_sz + tgt_sz;
+		}
+
+	skip_rule_dup_check:
+		;
+		size_t new_total_len = ksu_hide_rule_len + needed_len;
+		char *new_ptr = krealloc(ksu_hide_rule_list, new_total_len, GFP_KERNEL);
+		if (!new_ptr)
+			goto out_unlock;
+
+		ksu_hide_rule_list = new_ptr;
+
+		char *w_ptr_src = ksu_hide_rule_list + ksu_hide_rule_len;
+		sprintf(w_ptr_src, ":%s:", src);
+
+		char *w_ptr_tgt = w_ptr_src + strlen(w_ptr_src) + 1; 
+		sprintf(w_ptr_tgt, ":%s:", tgt);
+
+		ksu_hide_rule_len = new_total_len;
+
+		pr_info("selinux_hide: tracking rule: %s %s\n", w_ptr_src, w_ptr_tgt);
+
+	}
+
+out_unlock:
+	mutex_unlock(&selinux_hide_list_mutex);
+}
+
+#if 0
+static inline bool ksu_should_destroy_context(char *str)
+{
+	if (!str)
+		return false;
+
+	down_read(&ksu_sepolicy_list_lock);
+
+	struct ksu_type_node *t_node;
+	list_for_each_entry(t_node, &ksu_hide_type_list, list) {
+		if (strstr(str, t_node->padded_name)) {
+			up_read(&ksu_sepolicy_list_lock);
+			return true;
+		}
+	}
+
+	// double strstr
+	char *str2 = strchr(str, ' ');
+	if (!str2) {
+		up_read(&ksu_sepolicy_list_lock);
+		return false;
+	}		
+
+	struct ksu_rule_node *r_node;
+	list_for_each_entry(r_node, &ksu_hide_rule_list, list) {
+		if (strstr(str, r_node->src) && strstr(str2, r_node->tgt)) {
+			up_read(&ksu_sepolicy_list_lock);
+			return true;
+		}
+	}
+
+	up_read(&ksu_sepolicy_list_lock);
+	return false;
+}
+#endif
+
+#if defined(CONFIG_KPROBES)
+#include <linux/kprobes.h>
+
+static struct kprobe *slow_avc_audit_kp;
+
+static int slow_avc_audit_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+		u32 *tsid = (u32 *)&PT_REGS_PARM2(regs);
+
+	ksu_slow_avc_audit(tsid);
+
+	return 0;
+}
+
+static struct kprobe *init_kprobe(const char *name, kprobe_pre_handler_t handler)
+{
+	struct kprobe *kp = kzalloc(sizeof(struct kprobe), GFP_KERNEL);
+	if (!kp)
+		return NULL;
+	kp->symbol_name = name;
+	kp->pre_handler = handler;
+
+	int ret = register_kprobe(kp);
+	pr_info("%s: register %s kprobe: %d\n", __func__, name, ret);
+	if (ret) {
+		kfree(kp);
+		return NULL;
+	}
+
+	return kp;
+}
+
+static void destroy_kprobe(struct kprobe **kp_ptr)
+{
+	struct kprobe *kp = *kp_ptr;
+	if (!kp)
+		return;
+	unregister_kprobe(kp);
+	synchronize_rcu();
+	kfree(kp);
+	*kp_ptr = NULL;
+}
+#endif // CONFIG_KPROBES
+
 static void ksu_selinux_hide_enable(void)
 {
 	if (ksu_selinux_get_sids())
@@ -43,14 +299,55 @@ static void ksu_selinux_hide_enable(void)
 #if defined(CONFIG_KPROBES)
 	slow_avc_audit_kp = init_kprobe("slow_avc_audit", slow_avc_audit_pre_handler);
 #endif
+
+	ksu_selinux_hide_is_enabled = true;
 }
 
 static void ksu_selinux_hide_disable(void)
 {
 #if defined(CONFIG_KPROBES)
+	pr_info("selinux_hide: unregitered slow_avc_audit");
 	destroy_kprobe(&slow_avc_audit_kp);
 #endif
+
+	pr_info("selinux_hide: going down");
+	ksu_selinux_hide_is_enabled = false;
 }
+
+static ssize_t (*selinux_transaction_write_fn)(struct file *file, const char __user *buf, size_t size, loff_t *pos) __read_mostly = NULL;
+static __nocfi ssize_t ksu_selinux_transaction_write(struct file *file, const char __user *buf, size_t size, loff_t *pos)
+{
+	if (unlikely(!ksu_selinux_hide_is_enabled))
+		goto skip_destroy;
+
+	if (!test_thread_flag(TIF_SECCOMP))
+		goto skip_destroy;
+
+	if (current_uid().val < 10000)
+		goto skip_destroy;
+
+	char kbuf[128] = { 0 };
+	if (ksu_copy_from_user_retry(kbuf, buf, 127))
+		goto skip_destroy;
+
+	if (!ksu_should_destroy_context(kbuf))
+		goto skip_destroy;
+
+	// or copy_to_user? is it writable? or we vm_mmap? or hunt for writable section on start_stack again?
+	// NOTE: if this is 'timeable', to equalize, we should call selinux_transaction_write_fn before ret EINVAL
+	pr_info("selinux_hide: selinux_transaction_write: destroy: %s \n", kbuf);
+	return -EINVAL;
+
+skip_destroy:
+	return selinux_transaction_write_fn(file, buf, size, pos);
+}
+
+#if defined(KSU_COMPAT_USE_SELINUX_STATE)
+extern struct selinux_state selinux_state;
+#define ksu_selinux_kernel_status_page() selinux_kernel_status_page(&selinux_state)
+#else
+#define ksu_selinux_kernel_status_page() selinux_kernel_status_page()
+#endif
 
 static void initialize_fake_status(void)
 {
@@ -61,11 +358,8 @@ static void initialize_fake_status(void)
 	if (fake_status) /* double-check after lock */
 		goto out;
 
-#ifdef KSU_COMPAT_USE_SELINUX_STATE
-	struct page *real_page = selinux_kernel_status_page(&selinux_state);
-#else
-	struct page *real_page = selinux_kernel_status_page();
-#endif
+	struct page *real_page = ksu_selinux_kernel_status_page();
+
 	if (!real_page) {
 		pr_warn("ksu_selinux_hide: status_page not exists\n");
 		goto out;
@@ -95,7 +389,7 @@ static void initialize_fake_status(void)
 		new_status->sequence = 4;
 	}
 	
-	WRITE_ONCE(fake_status, new_page);
+	smp_store_release(&fake_status, new_page);
 	pr_info("ksu_selinux_hide: fake status ready: sequence=%d policyload=%d enforcing=%d\n",
 		new_status->sequence, new_status->policyload,
 		new_status->enforcing);
@@ -107,12 +401,12 @@ typedef int (*sel_open_handle_status_fn)(struct inode *inode,
 					 struct file *filp);
 static sel_open_handle_status_fn orig_sel_open_handle_status = NULL;
 
-static int __nocfi my_sel_open_handle_status(struct inode *inode, struct file *filp)
+static int __nocfi ksu_sel_open_handle_status(struct inode *inode, struct file *filp)
 {
 	if (likely(test_thread_flag(TIF_SECCOMP) &&
 	current_uid().val >= 10000 &&
 		   ksu_selinux_hide_is_enabled)) {
-		struct page *data = READ_ONCE(fake_status);
+		struct page *data = smp_load_acquire(&fake_status);
 		if (data) {
 			filp->private_data = data;
 			return 0;
@@ -124,18 +418,17 @@ static int __nocfi my_sel_open_handle_status(struct inode *inode, struct file *f
 
 #define FORCE_VOLATILE(x) *(volatile typeof(x) *)&(x)
 
-static int patch_fops_open(struct file_operations *ops,
-			    sel_open_handle_status_fn new_open)
+static int patch_fops_member(void **member_addr, void *new_fn)
 {
-	unsigned long addr = (unsigned long)&ops->open;
+	unsigned long addr = (unsigned long)member_addr;
 	unsigned long base = addr & PAGE_MASK;
 	unsigned long offset = addr & ~PAGE_MASK;
-	
+
 	struct page *page = phys_to_page(__pa(base));
 	if (!page)
 		return -EFAULT;
 
-void *writable_addr = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
+	void *writable_addr = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
 	if (!writable_addr)
 		return -ENOMEM;
 
@@ -143,13 +436,25 @@ void *writable_addr = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
 
 	preempt_disable();
 	local_irq_disable();
-	FORCE_VOLATILE(*target_slot) = (void *)new_open;
+	FORCE_VOLATILE(*target_slot) = new_fn;
 	local_irq_enable();
 	preempt_enable();
 
 	vunmap(writable_addr);
 	smp_mb();
 	return 0;
+}
+
+static int patch_fops_open(struct file_operations *ops,
+					sel_open_handle_status_fn new_open)
+{
+	return patch_fops_member((void **)&ops->open, (void *)new_open);
+}
+
+static int patch_fops_write(struct file_operations *ops,
+			     ssize_t (*new_write)(struct file *, const char __user *, size_t, loff_t *))
+{
+	return patch_fops_member((void **)&ops->write, (void *)new_write);
 }
 
 static int resolve_fops(const char *path_str, struct file_operations **out_fops)
@@ -175,6 +480,43 @@ out:
 	return ret;
 }
 
+static void hook_selinux_transaction_write(void)
+{
+	if (selinux_transaction_write_fn)
+		return;
+
+	struct file_operations *ops = NULL;
+	if (resolve_fops("/sys/fs/selinux/context", &ops)) {
+		pr_err("ksu_selinux_hide: sel_context_ops not found, context hide disabled\n");
+		return;
+	}
+
+	if (!ops->write) {
+		pr_err("ksu_selinux_hide: sel_context_ops->write is NULL\n");
+		return;
+	}
+
+	selinux_transaction_write_fn = ops->write;
+	patch_fops_write(ops, ksu_selinux_transaction_write);
+	pr_info("ksu_selinux_hide: hooked sel_context_ops->write\n");
+}
+
+static void unhook_selinux_transaction_write(void)
+{
+	if (!selinux_transaction_write_fn)
+		return;
+
+	struct file_operations *ops = NULL;
+	if (resolve_fops("/sys/fs/selinux/context", &ops)) {
+		pr_err("ksu_selinux_hide: sel_context_ops not found on unhook\n");
+		return;
+	}
+
+	patch_fops_write(ops, selinux_transaction_write_fn);
+	selinux_transaction_write_fn = NULL;
+	pr_info("ksu_selinux_hide: unhooked sel_context_ops->write\n");
+}
+
 static void hook_selinux_status_open(void)
 {
 	if (orig_sel_open_handle_status)
@@ -192,7 +534,7 @@ static void hook_selinux_status_open(void)
 	}
 	
 	orig_sel_open_handle_status = ops->open;
-	patch_fops_open(ops, my_sel_open_handle_status);
+	patch_fops_open(ops, ksu_sel_open_handle_status);
 	pr_info("ksu_selinux_hide: hooked sel_handle_status_ops->open\n");
 }
 
@@ -247,7 +589,7 @@ static int ksu_hide_init_thread(void *data)
 {
 	set_user_nice(current, 19);
 
-	#ifndef KSU_KPROBES_HOOK
+#ifndef KSU_KPROBES_HOOK
 	while (READ_ONCE(ksu_input_hook))
 		msleep(5000);
 #endif
@@ -255,10 +597,12 @@ static int ksu_hide_init_thread(void *data)
 	if (ksu_selinux_hide_is_enabled)
 		ksu_selinux_hide_enable();
 
+	hook_selinux_transaction_write();
+
 	int tries = 0;
 try_again:
 	initialize_fake_status();
-	if (READ_ONCE(fake_status))
+	if (smp_load_acquire(&fake_status))
 		goto page_ok;
 
 	msleep(1000);
@@ -278,6 +622,8 @@ void __init ksu_selinux_hide_init(void)
 	if (ksu_register_feature_handler(&selinux_hide_status_handler))
 		pr_err("ksu_selinux_hide: failed to register feature handler\n");
 
+	ksu_add_probe_to_list(cmd, KERNEL_SU_DOMAIN("ksu"));
+	ksu_add_probe_to_list(cmd, KERNEL_SU_FILE("ksu_file"));
 	kthread_run(ksu_hide_init_thread, NULL, "ksu_selinux_hide_init");
 }
 
@@ -285,11 +631,9 @@ void __exit ksu_selinux_hide_exit(void)
 {
 	ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE_STATUS);
 	unhook_selinux_status_open();
+	unhook_selinux_transaction_write();
 	ksu_selinux_hide_disable();
-	mutex_lock(&fake_status_init_mutex);
-	if (fake_status) {
-		__free_page(fake_status);
-		fake_status = NULL;
-	}
-	mutex_unlock(&fake_status_init_mutex);
+	/* fake_status is intentionally never freed: filp->private_data on any
+	 * still-open /sys/fs/selinux/status fd may reference it indefinitely,
+	 * and there is no refcount tying page lifetime to open-file lifetime. */
 }

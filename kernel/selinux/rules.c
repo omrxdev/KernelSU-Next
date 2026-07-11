@@ -23,6 +23,7 @@
 #include "linux/lsm_audit.h" // IWYU pragma: keep
 #include "xfrm.h"
 #include "compat/kernel_compat.h"
+#include "feature/selinux_hide.h"
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
 #define SELINUX_POLICY_INSTEAD_SELINUX_SS
@@ -355,7 +356,7 @@ static int sepol_require_not_all(const char *value, const char *name)
     return -EINVAL;
 }
 
-static int sepol_expected_argc(u32 cmd)
+int sepol_expected_argc(u32 cmd)
 {
     switch (cmd) {
     case KSU_SEPOLICY_CMD_NORMAL_PERM:
@@ -636,6 +637,7 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
 			pr_err("sepol: cmd #%u failed, cmd=%u subcmd=%u.\n", cmd_index, header.cmd, header.subcmd);
 		} else {
 			success_cmd_count++;
+            ksu_add_probe_to_list(header.cmd, args);
 		}
 		cmd_index++;
 	}
@@ -712,6 +714,7 @@ static int handle_sepolicy_fn(void *data)
 			pr_err("sepol: cmd #%u failed, cmd=%u subcmd=%u.\n", cmd_index, header.cmd, header.subcmd);
 		else {
 			success_cmd_count++;
+            ksu_add_probe_to_list(header.cmd, args);
 		}
 
 		cmd_index++;
