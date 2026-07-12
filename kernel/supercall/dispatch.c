@@ -17,7 +17,9 @@
 #include "manager/manager_identity.h"
 #include "selinux/selinux.h"
 #include "infra/file_wrapper.h"
+#ifdef CONFIG_KSU_KPROBES_HOOK
 #include "hook/tp_marker.h"
+#endif
 #include "policy/app_profile.h"
 #include "sulog/event.h"
 #include "sulog/fd.h"
@@ -373,7 +375,9 @@ static int do_set_app_profile(void __user *arg)
     ret = ksu_set_app_profile(&cmd.profile);
     if (!ret) {
         ksu_persistent_allow_list();
+#ifdef CONFIG_KSU_KPROBES_HOOK
         ksu_mark_running_process();
+#endif
     }
     return ret;
 }
@@ -441,6 +445,7 @@ static int do_get_wrapper_fd(void __user *arg)
 
 static int do_manage_mark(void __user *arg)
 {
+#ifdef CONFIG_KSU_KPROBES_HOOK
     struct ksu_manage_mark_cmd cmd;
     int ret = 0;
 
@@ -500,6 +505,11 @@ static int do_manage_mark(void __user *arg)
     }
 
     return 0;
+#else
+	// We don't care, just return -ENOTSUPP
+	pr_warn("manage_mark: this supercalls is not implemented for manual hook.\n");
+	return -ENOTSUPP;
+#endif
 }
 
 static int do_nuke_ext4_sysfs(void __user *arg)
@@ -694,10 +704,18 @@ static int do_get_hook_mode(void __user *arg)
 {
     struct ksu_get_hook_mode_cmd cmd = {0};
 
-#ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
-    strscpy(cmd.mode, "Tracepoint", sizeof(cmd.mode));
+#ifdef CONFIG_KSU_MANUAL_HOOK
+    const char *type = "Manual";
+#elif defined(CONFIG_HAVE_SYSCALL_TRACEPOINTS)
+    const char *type = "Tracepoint";
 #else
-    strscpy(cmd.mode, "Kprobes", sizeof(cmd.mode));
+    const char *type = "Kprobes";
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
+    strscpy(cmd.mode, type, sizeof(cmd.mode));
+#else
+    strlcpy(cmd.mode, type, sizeof(cmd.mode));
 #endif
 
     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
@@ -712,7 +730,11 @@ static int do_get_version_tag(void __user *arg)
 {
     struct ksu_get_version_tag_cmd cmd = {0};
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
     strscpy(cmd.tag, KERNEL_SU_VERSION_TAG, sizeof(cmd.tag));
+#else
+    strlcpy(cmd.tag, KERNEL_SU_VERSION_TAG, sizeof(cmd.tag));
+#endif
 
     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
         pr_err("get_version_tag: copy_to_user failed\n");
@@ -919,11 +941,11 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
         .handler = do_get_sulog_fd,
         .perm_check = only_root
     },
-    { 
-        .cmd = KSU_IOCTL_DISABLE_ESCAPE_TO_ROOT, 
-        .name = "DISABLE_ESCAPE_TO_ROOT", 
-        .handler = do_disable_escape_to_root, 
-        .perm_check = only_root 
+    {
+        .cmd = KSU_IOCTL_DISABLE_ESCAPE_TO_ROOT,
+        .name = "DISABLE_ESCAPE_TO_ROOT",
+        .handler = do_disable_escape_to_root,
+        .perm_check = only_root
     },
     {
         .cmd = KSU_IOCTL_GET_HOOK_MODE,

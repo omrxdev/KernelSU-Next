@@ -8,6 +8,7 @@
 
 #include <linux/types.h>
 #include "linux/version.h"
+#include "compat/kernel_compat.h"
 
 #ifdef __aarch64__
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)

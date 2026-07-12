@@ -12,6 +12,7 @@
 #include "klog.h" // IWYU pragma: keep
 #include "manager/manager_identity.h"
 #include "manager/throne_tracker.h"
+#include "compat/kernel_compat.h"
 
 uid_t ksu_manager_appid = KSU_INVALID_APPID;
 
@@ -271,13 +272,13 @@ void track_throne(bool prune_only)
 	loff_t line_start = 0;
 	char buf[KSU_MAX_PACKAGE_NAME];
 	for (;;) {
-		ssize_t count = kernel_read(fp, &chr, sizeof(chr), &pos);
+		ssize_t count = ksu_kernel_read_compat(fp, &chr, sizeof(chr), &pos);
 		if (count != sizeof(chr))
 			break;
 		if (chr != '\n')
 			continue;
 
-		count = kernel_read(fp, buf, sizeof(buf) - 1, &line_start);
+		count = ksu_kernel_read_compat(fp, buf, sizeof(buf) - 1, &line_start);
 		if (count <= 0) {
 			break;
 		}

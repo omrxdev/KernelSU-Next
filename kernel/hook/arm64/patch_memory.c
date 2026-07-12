@@ -11,7 +11,21 @@
 #include "linux/uaccess.h"
 #include "linux/stop_machine.h"
 #include "asm/cacheflush.h"
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
 #include "asm-generic/fixmap.h"
+#include "asm/fixmap.h"
+#else
+#include "linux/vmalloc.h"
+#include "linux/mm.h"
+#include "linux/highmem.h"
+#endif
+
+#ifndef __p4d_to_phys
+#define KSU_P4D_TO_PHYS(p4d) (p4d_val(p4d) & PHYS_MASK)
+#else
+#define KSU_P4D_TO_PHYS(p4d) __p4d_to_phys(p4d)
+#endif
 
 // https://github.com/fuqiuluo/ovo/blob/f7da411458e87d32438dc14fce5a3313ed0c967e/ovo/mmuhack.c#L21
 
@@ -23,7 +37,9 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
 {
     struct mm_struct *mm = &init_mm;
     pgd_t *pgd;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
     p4d_t *p4d;
+#endif
     pud_t *pud;
     pmd_t *pmd;
     pte_t *pte;
@@ -36,6 +52,7 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
     pr_debug("pgd of 0x%lx p=0x%lx v=0x%lx", addr, (uintptr_t)pgd,
              (uintptr_t)pgd_val(*pgd));
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
     p4d = p4d_offset(pgd, addr);
     if (p4d_none(*p4d) || p4d_bad(*p4d))
         goto fail;
@@ -44,11 +61,14 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
 #if defined(p4d_leaf)
     if (p4d_leaf(*p4d)) {
         pr_debug("Address 0x%lx maps to a P4D-level huge page\n", addr);
-        return __p4d_to_phys(*p4d) + ((addr & ~P4D_MASK));
+        return KSU_P4D_TO_PHYS(*p4d) + ((addr & ~P4D_MASK));
     }
 #endif
 
     pud = pud_offset(p4d, addr);
+#else // For older kernels without 4-level paging, the pud is directly under pgd.
+    pud = pud_offset(pgd, addr);
+#endif
     if (pud_none(*pud) || pud_bad(*pud))
         goto fail;
     pr_debug("pud of 0x%lx p=0x%lx v=0x%lx", addr, (uintptr_t)pud,
@@ -131,12 +151,12 @@ struct patch_text_info {
 // not a big problem because we are in stop_machine.
 // ^1: https://github.com/NothingOSS/android_kernel_device_modules_6.1_nothing_mt6878/blob/957dac185efe46cbf6336b0fff9516d84c8cd78f/drivers/misc/mediatek/mkp/mkp_main.c#L29
 // ^2: https://github.com/torvalds/linux/commit/c0eb315ad9719e41ce44708455cc69df7ac9f3f8
-static int ksu_patch_text_nosync(void *dst, void *src, size_t len, int flags)
+static int ksu_patch_text_nosync(struct patch_text_info *info)
 {
-    pr_debug("patch dst=0x%lx src=0x%lx len=%ld\n", (unsigned long)dst,
-             (unsigned long)src, len);
+    pr_debug("patch dst=0x%lx src=0x%lx len=%ld\n", (unsigned long)info->dst,
+             (unsigned long)info->src, info->len);
 
-    unsigned long p = (unsigned long)dst;
+    unsigned long p = (unsigned long)info->dst;
     int ret;
 
     int phy_err;
@@ -148,18 +168,40 @@ static int ksu_patch_text_nosync(void *dst, void *src, size_t len, int flags)
     }
     pr_debug("phy addr for patch 0x%lx: 0x%lx\n", p, phy);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
     void *map = set_fixmap_offset(FIX_TEXT_POKE0, phy);
+#else
+    unsigned long offset = phy & ~PAGE_MASK;
+    unsigned long pfn = phy >> PAGE_SHIFT;
+    struct page *page;
+
+    if (offset + info->len > PAGE_SIZE || !pfn_valid(pfn)) {
+        pr_err("ksu_patch: invalid pfn or boundary crossing for 0x%lx\n", p);
+        return -EINVAL;
+    }
+
+    page = pfn_to_page(pfn);
+    void *vmap_base = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
+    if (!vmap_base) return -ENOMEM;
+    
+    map = (void *)((unsigned long)vmap_base + offset);
+#endif
     pr_debug("fixmap addr for patch 0x%lx: 0x%lx\n", p, (unsigned long)map);
 
-    ret = (int)copy_to_kernel_nofault(map, src, len);
+    ret = (int)copy_to_kernel_nofault(map, info->src, info->len);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
     clear_fixmap(FIX_TEXT_POKE0);
+#else
+    flush_kernel_vmap_range(map, info->len);
+    vunmap((void *)((unsigned long)map - offset));
+#endif
 
-    if (!ret) {
-        if (flags & KSU_PATCH_TEXT_FLUSH_ICACHE)
-            ksu_flush_icache((uintptr_t)dst, (uintptr_t)dst + len);
-        if (flags & KSU_PATCH_TEXT_FLUSH_DCACHE)
-            ksu_flush_dcache(dst, len);
+    if (ret == 0) {
+        if (info->flags & KSU_PATCH_TEXT_FLUSH_ICACHE)
+            ksu_flush_icache((uintptr_t)info->dst, (uintptr_t)info->dst + info->len);
+        if (info->flags & KSU_PATCH_TEXT_FLUSH_DCACHE)
+            ksu_flush_dcache(info->dst, info->len);
     }
 
 err:
@@ -170,15 +212,11 @@ err:
 static int ksu_patch_text_cb(void *arg)
 {
     struct patch_text_info *pp = arg;
-    void *dst = pp->dst, *src = pp->src;
-    size_t len = pp->len;
-    int flags = pp->flags;
-
     int ret = 0;
 
     /* The last CPU becomes master */
     if (atomic_inc_return(&pp->cpu_count) == num_online_cpus()) {
-        ret = ksu_patch_text_nosync(dst, src, len, flags);
+        ret = ksu_patch_text_nosync(pp);
         /* Notify other processors with an additional increment. */
         atomic_inc(&pp->cpu_count);
     } else {

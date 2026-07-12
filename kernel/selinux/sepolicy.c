@@ -9,10 +9,13 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
+#include <linux/mutex.h>
 
+#include "selinux.h"
 #include "sepolicy.h"
 #include "klog.h" // IWYU pragma: keep
 #include "ss/symtab.h"
+#include "compat/kernel_compat.h" // Add check Huawei Device
 
 #define KSU_SUPPORT_ADD_TYPE
 
@@ -175,6 +178,11 @@ static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
 
     for (i = 0; i < db->te_avtab.nslot; i++) {
         prev = NULL;
+        // https://github.com/torvalds/linux/commit/acdf52d97f824019888422842757013b37441dd1   <- 5.1
+        // https://github.com/torvalds/linux/commit/ba39db6e0519aa8362dbda6523ceb69349a18dc3    <- 4.1
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0) ||   \
+    LINUX_VERSION_CODE < KERNEL_VERSION(4, 1, 0)  ||   \
+    defined(KSU_COMPAT_HAS_MODERN_POLICYDB)
         for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {
             if (n != node)
                 continue;
@@ -198,6 +206,34 @@ static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
                 db->len -= shrink_size;
             return true;
         }
+#else
+        for (n = flex_array_get_ptr(db->te_avtab.htable, i); n; prev = n, n = n->next) {
+            if (n != node)
+                continue;
+
+            if (prev) {
+                prev->next = n->next;
+            } else {
+                flex_array_put_ptr(db->te_avtab.htable, i, n->next, GFP_KERNEL | __GFP_ZERO);
+            }
+
+            if (db->te_avtab.nel > 0)
+                db->te_avtab.nel--;
+
+            if ((n->key.specified & AVTAB_XPERMS) && n->datum.u.xperms) {
+                shrink_size += sizeof(u8) + sizeof(u8) + sizeof(u32) * ARRAY_SIZE(n->datum.u.xperms->perms.p);
+            }
+            n->next = NULL;
+
+            flex_array_put_ptr(removed.htable, 0, n, GFP_KERNEL | __GFP_ZERO);
+
+            removed.nel = 1;
+            avtab_destroy(&removed);
+            if (db->len >= shrink_size)
+                db->len -= shrink_size;
+            return true;
+        }
+#endif
     }
 
     avtab_destroy(&removed);
@@ -559,9 +595,7 @@ static const struct hashtab_key_params filenametr_key_params = {
     .cmp = filenametr_cmp,
 };
 #endif
-
-static bool add_filename_trans(struct policydb *db, const char *s,
-                               const char *t, const char *c, const char *d,
+static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
                                const char *o)
 {
     struct type_datum *src, *tgt, *def;
@@ -588,6 +622,7 @@ static bool add_filename_trans(struct policydb *db, const char *s,
         return false;
     }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0) || defined(KSU_COMPAT_HAS_FILENAME_TRANS_KEY)
     struct filename_trans_key key;
     key.ttype = tgt->value;
     key.tclass = cls->value;
@@ -595,7 +630,11 @@ static bool add_filename_trans(struct policydb *db, const char *s,
 
     struct filename_trans_datum *last = NULL;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0) || defined(KSU_COMPAT_HAS_HASHTAB_KEY_PARAMS)
     struct filename_trans_datum *trans = policydb_filenametr_search(db, &key);
+#else
+    struct filename_trans_datum *trans = hashtab_search(&db->filename_trans, &key);
+#endif
     while (trans) {
         if (ebitmap_get_bit(&trans->stypes, src->value - 1)) {
             // Duplicate, overwrite existing data and return
@@ -623,6 +662,36 @@ static bool add_filename_trans(struct policydb *db, const char *s,
 
     db->compat_filename_trans_count++;
     return ebitmap_set_bit(&trans->stypes, src->value - 1, 1) == 0;
+#else // < 5.7.0, has no filename_trans_key, but struct filename_trans
+
+    struct filename_trans key;
+    key.ttype = tgt->value;
+    key.tclass = cls->value;
+    key.name = (char *)o;
+
+    struct filename_trans_datum *trans = hashtab_search(db->filename_trans, &key);
+
+    if (trans == NULL) {
+        trans = 
+            (struct filename_trans_datum *)kcalloc(sizeof(*trans), 1, GFP_KERNEL);
+        if (!trans) {
+            pr_err("add_filename_trans: Failed to alloc datum\n");
+            return false;
+        }
+        struct filename_trans *new_key = 
+            (struct filename_trans *)kzalloc(sizeof(*new_key), GFP_KERNEL);
+        if (!new_key) {
+            pr_err("add_filename_trans: Failed to alloc new_key\n");
+            return false;
+        }
+        *new_key = key;
+        new_key->name = kstrdup(key.name, GFP_KERNEL);
+        trans->otype = def->value;
+        hashtab_insert(db->filename_trans, new_key, trans);
+    }
+
+    return ebitmap_set_bit(&db->filename_trans_ttypes, src->value - 1, 1) == 0;
+#endif
 }
 
 static bool add_genfscon(struct policydb *db, const char *fs_name,
@@ -661,6 +730,7 @@ void *ksu_kvrealloc_compat(const void *p, size_t oldsize, size_t newsize,
 
 static bool add_type(struct policydb *db, const char *type_name, bool attr)
 {
+#ifdef KSU_SUPPORT_ADD_TYPE
     struct type_datum *type = symtab_search(&db->p_types, type_name);
     if (type) {
         pr_warn("Type %s already exists\n", type_name);
@@ -689,6 +759,7 @@ static bool add_type(struct policydb *db, const char *type_name, bool attr)
         return false;
     }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0) || defined(KSU_COMPAT_HAS_MODERN_POLICYDB)
     struct ebitmap *new_type_attr_map_array =
         ksu_kvrealloc(db->type_attr_map_array, value * sizeof(struct ebitmap),
                       (value - 1) * sizeof(struct ebitmap));
@@ -732,6 +803,167 @@ static bool add_type(struct policydb *db, const char *type_name, bool attr)
     }
 
     return true;
+
+#elif defined(KSU_COMPAT_IS_HISI_LEGACY)
+    /*
+   * Huawei use type_attr_map and type_val_to_struct.
+   * And use ebitmap not flex_array.
+   */
+    size_t new_size = sizeof(struct ebitmap) * db->p_types.nprim;
+    struct ebitmap *new_type_attr_map = 
+        (krealloc(db->type_attr_map, new_size, GFP_KERNEL));
+
+    struct type_datum **new_type_val_to_struct =
+        krealloc(db->type_val_to_struct, sizeof(*db->type_val_to_struct) * db->p_types.nprim, GFP_KERNEL);
+
+    if (!new_type_attr_map) {
+        pr_err("add_type: alloc type_attr_map failed\n");
+        return false;
+    }
+
+    if (!new_type_val_to_struct) {
+        pr_err("add_type: alloc type_val_to_struct failed\n");
+        return false;
+    }
+
+    char **new_val_to_name_types =
+        krealloc(db->sym_val_to_name[SYM_TYPES], 
+                sizeof(char *) * db->symtab[SYM_TYPES].nprim, GFP_KERNEL);
+    if (!new_val_to_name_types) {
+        pr_err("add_type: alloc val_to_name failed\n");
+        return false;
+    }
+
+    db->type_attr_map = new_type_attr_map;
+    ebitmap_init(&db->type_attr_map[value - 1], HISI_SELINUX_EBITMAP_RO);
+    ebitmap_set_bit(&db->type_attr_map[value - 1], value - 1, 1);
+
+    db->type_val_to_struct = new_type_val_to_struct;
+    db->type_val_to_struct[value - 1] = type;
+
+    db->sym_val_to_name[SYM_TYPES] = new_val_to_name_types;
+    db->sym_val_to_name[SYM_TYPES][value - 1] = key;
+
+    int i;
+    for (i = 0; i < db->p_roles.nprim; ++i) {
+        ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
+    }
+
+    return true;
+#else
+    // flex_array is not extensible, we need to create a new bigger one instead
+    struct flex_array *new_type_attr_map_array =
+        flex_array_alloc(sizeof(struct ebitmap), 
+                        db->p_types.nprim, GFP_KERNEL | __GFP_ZERO);
+
+    struct flex_array *new_type_val_to_struct =
+        flex_array_alloc(sizeof(struct type_datum *), 
+                        db->p_types.nprim, GFP_KERNEL | __GFP_ZERO);
+
+    struct flex_array *new_val_to_name_types =
+        flex_array_alloc(sizeof(char *), 
+                        db->symtab[SYM_TYPES].nprim, GFP_KERNEL | __GFP_ZERO);
+
+    if (!new_type_attr_map_array) {
+        pr_err("add_type: alloc type_attr_map_array failed\n");
+        return false;
+    }
+
+    if (!new_type_val_to_struct) {
+        pr_err("add_type: alloc type_val_to_struct failed\n");
+        return false;
+    }
+
+    if (!new_val_to_name_types) {
+        pr_err("add_type: alloc val_to_name failed\n");
+        return false;
+    }
+
+    // preallocate so we don't have to worry about the put ever failing
+    if (flex_array_prealloc(new_type_attr_map_array, 0, db->p_types.nprim, GFP_KERNEL | __GFP_ZERO)) {
+        pr_err("add_type: prealloc type_attr_map_array failed\n");
+        return false;
+    }
+
+    if (flex_array_prealloc(new_type_val_to_struct, 0, db->p_types.nprim, GFP_KERNEL | __GFP_ZERO)) {
+        pr_err("add_type: prealloc type_val_to_struct_array failed\n");
+        return false;
+    }
+
+    if (flex_array_prealloc(new_val_to_name_types, 0, db->symtab[SYM_TYPES].nprim, GFP_KERNEL | __GFP_ZERO)) {
+        pr_err("add_type: prealloc val_to_name_types failed\n");
+        return false;
+    }
+
+    int j;
+    void *old_elem;
+    // copy the old data or pointers to new flex arrays
+    for (j = 0; j < db->type_attr_map_array->total_nr_elements; j++) {
+        old_elem = flex_array_get(db->type_attr_map_array, j);
+        if (old_elem)
+            flex_array_put(new_type_attr_map_array, j, 
+                            old_elem, GFP_KERNEL | __GFP_ZERO);
+    }
+
+    for (j = 0; j < db->type_val_to_struct_array->total_nr_elements; j++) {
+        old_elem = flex_array_get_ptr(db->type_val_to_struct_array, j);
+        if (old_elem)
+            flex_array_put_ptr(new_type_val_to_struct, j,
+                                old_elem, GFP_KERNEL | __GFP_ZERO);
+    }
+
+    for (j = 0; j < db->symtab[SYM_TYPES].nprim; j++) {
+        old_elem = flex_array_get_ptr(db->sym_val_to_name[SYM_TYPES], j);
+        if (old_elem)
+            flex_array_put_ptr(new_val_to_name_types, j,
+                                old_elem, GFP_KERNEL | __GFP_ZERO);
+    }
+
+    // store the pointer of old flex arrays first, when assigning new ones we
+    // should free it
+    struct flex_array *old_fa;
+
+    old_fa = db->type_attr_map_array;
+    db->type_attr_map_array = new_type_attr_map_array;
+    if (old_fa) {
+        flex_array_free(old_fa);
+    }
+
+// Huawei's EMUI 10+ / HM2 HKIP is closed, use the original flex_array_get and HISI_SELINUX_EBITMAP_RO(false)
+#if defined(KSU_COMPAT_IS_HISI_LEGACY_HM2)
+    ebitmap_init(flex_array_get(db->type_attr_map_array, value - 1),
+                                HISI_SELINUX_EBITMAP_RO);
+#else
+    ebitmap_init(flex_array_get(db->type_attr_map_array, value - 1));
+#endif
+    ebitmap_set_bit(flex_array_get(db->type_attr_map_array, value - 1), value - 1, 1);
+
+    old_fa = db->type_val_to_struct_array;
+    db->type_val_to_struct_array = new_type_val_to_struct;
+    if (old_fa) {
+        flex_array_free(old_fa);
+    }
+    flex_array_put_ptr(db->type_val_to_struct_array, value - 1,
+                        type, GFP_KERNEL | __GFP_ZERO);
+
+    old_fa = db->sym_val_to_name[SYM_TYPES];
+    db->sym_val_to_name[SYM_TYPES] = new_val_to_name_types;
+    if (old_fa) {
+        flex_array_free(old_fa);
+    }
+    flex_array_put_ptr(db->sym_val_to_name[SYM_TYPES], value - 1,
+                        key, GFP_KERNEL | __GFP_ZERO);
+
+    int i;
+    for (i = 0; i < db->p_roles.nprim; ++i) {
+        ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
+    }
+    return true;
+#endif
+
+#else
+    return false;
+#endif
 }
 
 static bool set_type_state(struct policydb *db, const char *type_name,
@@ -763,7 +995,21 @@ static bool set_type_state(struct policydb *db, const char *type_name,
 static void add_typeattribute_raw(struct policydb *db, struct type_datum *type,
                                   struct type_datum *attr)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0) || defined(KSU_COMPAT_HAS_MODERN_POLICYDB)
     struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];
+
+#elif defined(KSU_COMPAT_IS_HISI_LEGACY_HM2)
+    /* EMUI 10+ / HM2 dedicated branch (HKIP is closed, use the original flex_array_get) */
+    struct ebitmap *sattr = flex_array_get(db->type_attr_map_array, type->value - 1);
+
+#elif defined(KSU_COMPAT_IS_HISI_LEGACY)
+    /*
+    *  HISI_SELINUX_EBITMAP_RO is Huawei's unique features.
+    */
+    struct ebitmap *sattr = &db->type_attr_map[type->value - 1], HISI_SELINUX_EBITMAP_RO;
+#else
+    struct ebitmap *sattr = flex_array_get(db->type_attr_map_array, type->value - 1);
+#endif
     ebitmap_set_bit(sattr, attr->value - 1, 1);
 
     struct hashtab_node *node;
@@ -917,6 +1163,112 @@ bool ksu_genfscon(struct policydb *db, const char *fs_name, const char *path,
     return add_genfscon(db, fs_name, path, ctx);
 }
 
+// handle backport
+extern rwlock_t *ksu_policy_rwlock_ptr;
+
+static inline void ksu_lock_sepolicy_legacy(void)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) && !defined(KSU_COMPAT_HAS_POLICY_MUTEX)
+// 4.14 - 5.10
+#if defined(KSU_COMPAT_USE_SELINUX_STATE)
+    read_lock(&selinux_state.ss->policy_rwlock);
+// 4.14-
+#else
+    read_lock(ksu_policy_rwlock_ptr);
+#endif
+#endif
+}
+
+static inline void ksu_unlock_sepolicy_legacy(void)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) && !defined(KSU_COMPAT_HAS_POLICY_MUTEX)
+// 4.14 - 5.10
+#if defined(KSU_COMPAT_USE_SELINUX_STATE)
+    read_unlock(&selinux_state.ss->policy_rwlock);
+// 4.14-
+#else
+    read_unlock(ksu_policy_rwlock_ptr);
+#endif
+#endif
+}
+
+// result is len or errno
+int ksu_dup_policydb(struct policydb *old_db, struct policydb *new_db)
+{
+    struct policy_file fp = { 0 };
+    void *data;
+    int ret = 0;
+    int len = 0;
+
+    ksu_lock_sepolicy_legacy();
+    len = old_db->len;
+    ksu_unlock_sepolicy_legacy();
+
+    data = vmalloc(len);
+    if (!data) {
+        pr_err("alloc policy len %d\n", len);
+        ret = -ENOMEM;
+        goto out_free_data;
+    }
+
+    fp.data = data;
+    fp.len = len;
+
+    ksu_lock_sepolicy_legacy();
+    ret = policydb_write(old_db, &fp);
+    if (ret) {
+        pr_err("sepolicy: policydb_write: %d\n", ret);
+        ksu_unlock_sepolicy_legacy();
+        goto out_free_data;
+    }
+    ksu_unlock_sepolicy_legacy();
+
+    // https://android-review.googlesource.com/c/kernel/common/+/3009995
+    // Android won't add these flags to policydb_write....
+    // fixup config
+    // 4*2+8+4
+    static const size_t kConfigOff = 20;
+    if (len >= kConfigOff + sizeof(u32)) {
+        u32 *config_ptr = data + kConfigOff;
+#ifdef KSU_COMPAT_HAS_POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE
+        if (old_db->android_netlink_route) {
+            pr_info("adding POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE\n");
+            *config_ptr |= POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE;
+        }
+#endif
+#ifdef KSU_COMPAT_HAS_POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH
+        if (old_db->android_netlink_getneigh) {
+            pr_info("adding POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH\n");
+            *config_ptr |= POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH;
+        }
+#endif
+    }
+
+    // rewind fp
+    fp.data = data;
+    fp.len = len;
+
+    ret = policydb_read(new_db, &fp);
+    if (ret) {
+        pr_err("sepolicy: policydb_read: %d\n", ret);
+        goto out_free_data;
+    }
+
+    new_db->len = old_db->len;
+
+    vfree(data);
+    ret = len;
+
+    return ret;
+
+out_free_data:
+    vfree(data);
+    return ret;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_POLICY_MUTEX)
+// 5.10+ using selinux_policy
+
 // ======== sepolicy ========
 
 void ksu_destroy_sepolicy(struct selinux_policy *pol)
@@ -930,71 +1282,27 @@ struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
     int ret;
     size_t len;
     struct selinux_policy *new_pol;
-    void *data;
-    struct policy_file fp;
-
-    len = old_pol->policydb.len;
-    data = vmalloc(len);
-    if (!data) {
-        pr_err("alloc policy len %ld\n", len);
-        ret = -ENOMEM;
-        goto out_free_data;
-    }
-
-    fp.data = data;
-    fp.len = len;
-
-    ret = policydb_write(&old_pol->policydb, &fp);
-    if (ret) {
-        pr_err("sepolicy: policydb_write: %d\n", ret);
-        goto out_free_data;
-    }
-
-    // https://android-review.googlesource.com/c/kernel/common/+/3009995/11/security/selinux/ss/policydb.c
-    // fixup config
-    // 4*2+8+4
-    static const size_t kConfigOff = 20;
-    if (len >= kConfigOff + sizeof(u32)) {
-        u32 *config_ptr = (u32 *)((unsigned long)data + kConfigOff);
-        pr_info("old config: %u\n", *config_ptr);
-        if (old_pol->policydb.android_netlink_route) {
-            pr_info("adding POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE\n");
-            *config_ptr |= POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE;
-        }
-        if (old_pol->policydb.android_netlink_getneigh) {
-            pr_info("adding POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH\n");
-            *config_ptr |= POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH;
-        }
-        pr_info("new config: %u\n", *config_ptr);
-    }
 
     new_pol = kmemdup(old_pol, sizeof(*old_pol), GFP_KERNEL);
+
     if (!new_pol) {
         ret = -ENOMEM;
         pr_err("sepolicy: dup old pol\n");
-        goto out_free_data;
+        goto out;
     }
     memset(&new_pol->policydb, 0, sizeof(new_pol->policydb));
 
-    // rewind fp
-    fp.data = data;
-    fp.len = len;
+    ret = ksu_dup_policydb(&old_pol->policydb, &new_pol->policydb);
 
-    ret = policydb_read(&new_pol->policydb, &fp);
-    if (ret) {
-        pr_err("sepolicy: policydb_read: %d\n", ret);
+    if (ret < 0) {
         goto out_free_policydb;
     }
-    new_pol->policydb.len = old_pol->policydb.len;
-    kvfree(data);
 
     return new_pol;
 
 out_free_policydb:
     kfree(new_pol);
-
-out_free_data:
-    kvfree(data);
-
+out:
     return ERR_PTR(ret);
 }
+#endif

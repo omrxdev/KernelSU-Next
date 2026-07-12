@@ -13,6 +13,7 @@
 #include <linux/version.h>
 #include <linux/mount.h>
 
+#include "compat/kernel_compat.h"
 #include "objsec.h"
 
 #include "klog.h" // IWYU pragma: keep
@@ -99,7 +100,7 @@ static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb,
     kiocb->ki_filp = orig;
     return orig->f_op->iopoll(kiocb, icb, v);
 }
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
 static int ksu_wrapper_iopoll(struct kiocb *kiocb, bool spin)
 {
     struct ksu_file_wrapper *data = kiocb->ki_filp->private_data;
@@ -118,14 +119,17 @@ static int ksu_wrapper_iterate(struct file *fp, struct dir_context *dc)
 }
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)
 static int ksu_wrapper_iterate_shared(struct file *fp, struct dir_context *dc)
 {
     struct ksu_file_wrapper *data = fp->private_data;
     struct file *orig = data->orig;
     return orig->f_op->iterate_shared(orig, dc);
 }
+#endif
 
-static __poll_t ksu_wrapper_poll(struct file *fp, struct poll_table_struct *pts)
+// typedef unsigned __bitwise __poll_t;
+static unsigned __bitwise ksu_wrapper_poll(struct file *fp, struct poll_table_struct *pts)
 {
     struct ksu_file_wrapper *data = fp->private_data;
     struct file *orig = data->orig;
@@ -313,6 +317,7 @@ static void ksu_wrapper_show_fdinfo(struct seq_file *m, struct file *f)
     }
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)
 // https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/fs/read_write.c;l=1593-1606;drc=398da7defe218d3e51b0f3bdff75147e28125b60
 static ssize_t ksu_wrapper_copy_file_range(struct file *file_in, loff_t pos_in,
                                            struct file *file_out,
@@ -324,7 +329,9 @@ static ssize_t ksu_wrapper_copy_file_range(struct file *file_in, loff_t pos_in,
     return orig->f_op->copy_file_range(file_in, pos_in, orig, pos_out, len,
                                        flags);
 }
+#endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)
 // no REMAP_FILE_DEDUP: use file_in
 // https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/fs/read_write.c;l=1598-1599;drc=398da7defe218d3e51b0f3bdff75147e28125b60
 // https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/fs/remap_range.c;l=403-404;drc=398da7defe218d3e51b0f3bdff75147e28125b60
@@ -347,7 +354,9 @@ static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in,
                                             len, remap_flags);
     }
 }
+#endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
 static int ksu_wrapper_fadvise(struct file *fp, loff_t off1, loff_t off2,
                                int flags)
 {
@@ -358,6 +367,7 @@ static int ksu_wrapper_fadvise(struct file *fp, loff_t off1, loff_t off2,
     }
     return -EINVAL;
 }
+#endif
 
 static void ksu_release_file_wrapper(struct ksu_file_wrapper *data);
 
@@ -389,12 +399,16 @@ static struct ksu_file_wrapper *ksu_create_file_wrapper(struct file *fp)
     p->ops.write = fp->f_op->write ? ksu_wrapper_write : NULL;
     p->ops.read_iter = fp->f_op->read_iter ? ksu_wrapper_read_iter : NULL;
     p->ops.write_iter = fp->f_op->write_iter ? ksu_wrapper_write_iter : NULL;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
     p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;
+#endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
     p->ops.iterate = fp->f_op->iterate ? ksu_wrapper_iterate : NULL;
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)
     p->ops.iterate_shared =
         fp->f_op->iterate_shared ? ksu_wrapper_iterate_shared : NULL;
+#endif
     p->ops.poll = fp->f_op->poll ? ksu_wrapper_poll : NULL;
     p->ops.unlocked_ioctl =
         fp->f_op->unlocked_ioctl ? ksu_wrapper_unlocked_ioctl : NULL;
@@ -403,7 +417,7 @@ static struct ksu_file_wrapper *ksu_create_file_wrapper(struct file *fp)
     p->ops.mmap = fp->f_op->mmap ? ksu_wrapper_mmap : NULL;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
     p->ops.fop_flags = fp->f_op->fop_flags;
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
     p->ops.mmap_supported_flags = fp->f_op->mmap_supported_flags;
 #endif
     p->ops.flush = fp->f_op->flush ? ksu_wrapper_flush : NULL;
@@ -424,11 +438,17 @@ static struct ksu_file_wrapper *ksu_create_file_wrapper(struct file *fp)
     p->ops.setlease = fp->f_op->setlease ? ksu_wrapper_setlease : NULL;
     p->ops.fallocate = fp->f_op->fallocate ? ksu_wrapper_fallocate : NULL;
     p->ops.show_fdinfo = fp->f_op->show_fdinfo ? ksu_wrapper_show_fdinfo : NULL;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)
     p->ops.copy_file_range =
         fp->f_op->copy_file_range ? ksu_wrapper_copy_file_range : NULL;
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)
     p->ops.remap_file_range =
         fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
     p->ops.fadvise = fp->f_op->fadvise ? ksu_wrapper_fadvise : NULL;
+#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
     p->ops.splice_eof = fp->f_op->splice_eof ? ksu_wrapper_splice_eof : NULL;
@@ -466,7 +486,7 @@ static const struct dentry_operations ksu_file_wrapper_d_ops = {
 #define ksu_anon_inode_create_getfile_compat anon_inode_create_getfile
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 #define ksu_anon_inode_create_getfile_compat anon_inode_getfile_secure
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
 // There is no anon_inode_create_getfile before 5.16, but it's not difficult to implement it.
 // https://cs.android.com/android/kernel/superproject/+/common-android12-5.10:common/fs/anon_inodes.c;l=58-125;drc=0d34ce8aa78e38affbb501690bcabec4df88620e
 
@@ -478,8 +498,10 @@ ksu_anon_inode_make_secure_inode(const char *name,
                                  const struct inode *context_inode)
 {
     struct inode *inode;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
     const struct qstr qname = QSTR_INIT(name, strlen(name));
     int error;
+#endif
 
     if (unlikely(!anon_inode_mnt)) {
         return ERR_PTR(-ENODEV);
@@ -489,11 +511,13 @@ ksu_anon_inode_make_secure_inode(const char *name,
     if (IS_ERR(inode))
         return inode;
     inode->i_flags &= ~S_PRIVATE;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
     error = security_inode_init_security_anon(inode, &qname, context_inode);
     if (error) {
         iput(inode);
         return ERR_PTR(error);
     }
+#endif
     return inode;
 }
 
@@ -529,6 +553,13 @@ err_iput:
 err:
     module_put(fops->owner);
     return file;
+}
+#else // KERNEL_VERSION < 4.19
+struct file *ksu_anon_inode_create_getfile_compat(
+    const char *name, const struct file_operations *fops, void *priv,
+    int flags, const struct inode *context_inode)
+{
+    return anon_inode_getfile(name, fops, priv, flags);
 }
 #endif
 
@@ -609,7 +640,8 @@ done:
 
 void __init ksu_file_wrapper_init(void)
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0) &&    \
+    LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
     static const struct file_operations tmp = { .owner = THIS_MODULE };
     struct file *dummy = anon_inode_getfile("dummy", &tmp, NULL, 0);
     if (IS_ERR(dummy)) {
@@ -625,3 +657,4 @@ void __init ksu_file_wrapper_init(void)
     fput(dummy);
 #endif
 }
+

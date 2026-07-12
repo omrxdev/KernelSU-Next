@@ -2,12 +2,13 @@ menu "KernelSU"
 
 config KSU
 	tristate "KernelSU function support"
-	depends on KPROBES && EXT4_FS
+	depends on EXT4_FS
 	default y
 	help
 	  Enable kernel-level root privileges on Android System.
-	  Requires CONFIG_KPROBES for kernel hooking support.
 	  Requires CONFIG_EXT4_FS for `ext4_unregister_sysfs`.
+	  Use KSU_KPROBES_HOOK on GKI kernels with kprobe support, or
+	  KSU_MANUAL_HOOK for legacy/non-GKI integrations.
 	  To compile as a module, choose M here: the
 	  module will be called kernelsu.
 
@@ -34,5 +35,24 @@ config KSU_DISABLE_POLICY
 	  Disable per-app root/non-root profile customization.
 	  Escalation will always use the default full root profile, and
 	  non-root handling will follow the global umount policy only.
+
+# For easier extern ifdef handling
+config KSU_MANUAL_HOOK
+	bool "KernelSU manual hook mode."
+	depends on KSU && KSU != m
+	default y if !KPROBES
+	default n
+	help
+	  Enable manual hook support.
+
+config KSU_KPROBES_HOOK
+	bool "KernelSU tracepoint+kretprobe hook"
+	depends on KSU && !KSU_MANUAL_HOOK
+	depends on KRETPROBES && KPROBES && HAVE_SYSCALL_TRACEPOINTS
+	default y if KPROBES && KRETPROBES && HAVE_SYSCALL_TRACEPOINTS
+	default y if !KSU_MANUAL_HOOK
+	help
+	  Enable KPROBES, KRETPROBES and TRACEPOINT hook for KernelSU core.
+	  This should not be used on kernel below 5.10.
 
 endmenu

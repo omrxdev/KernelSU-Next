@@ -3,15 +3,29 @@
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <asm/current.h>
-#include <linux/compat.h>
 #include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/err.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
+#include <linux/input.h>
 #include <linux/input-event-codes.h>
+#else
+#include <uapi/linux/input.h>
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 1, 0)
+#include <linux/aio.h>
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+#include <linux/sched/signal.h>
+#else
+#include <linux/sched.h>
+#endif
+#ifdef CONFIG_KSU_KPROBES_HOOK
 #include <linux/kprobes.h>
+#endif
 #include <linux/printk.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
@@ -28,6 +42,7 @@
 #include "selinux/selinux.h"
 #include "hook/syscall_hook.h"
 #include "hook/syscall_event_bridge.h"
+#include "compat/kernel_compat.h"
 
 // clang-format off
 static const char KERNEL_SU_RC[] =
@@ -52,20 +67,13 @@ static const char KERNEL_SU_RC[] =
 static void stop_init_rc_hook();
 static void stop_execve_hook();
 
+#ifdef CONFIG_KSU_KPROBES_HOOK
 static struct work_struct stop_input_hook_work;
-
-#define MAX_ARG_STRINGS 0x7FFFFFFF
-struct user_arg_ptr {
-#ifdef CONFIG_COMPAT
-    bool is_compat;
+#else
+bool ksu_init_rc_hook __read_mostly = true;
+bool ksu_input_hook __read_mostly = true;
+bool ksud_execve_key __read_mostly = true;
 #endif
-    union {
-        const char __user *const __user *native;
-#ifdef CONFIG_COMPAT
-        const compat_uptr_t __user *compat;
-#endif
-    } ptr;
-};
 
 static const char __user *get_user_arg_ptr(struct user_arg_ptr argv, int nr)
 {
@@ -420,7 +428,7 @@ static bool is_init_rc(struct file *fp)
     return true;
 }
 
-static void ksu_install_rc_hook(struct file *file)
+void ksu_install_rc_hook(struct file *file)
 {
     if (!is_init_rc(file)) {
         return;
@@ -459,8 +467,11 @@ static void ksu_install_rc_hook(struct file *file)
     file->f_op = &fops_proxy;
 }
 
-static void ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr)
+void ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr)
 {
+#ifndef CONFIG_KSU_KPROBES_HOOK
+    return; // not enabled
+#endif
     struct file *file = fget(fd);
     if (!file) {
         return;
@@ -478,6 +489,11 @@ static bool is_volumedown_enough(unsigned int count)
 
 int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value)
 {
+#ifndef CONFIG_KSU_KPROBES_HOOK
+	if (!ksu_input_hook) {
+		return 0;
+	}
+#endif
     if (*type == EV_KEY && *code == KEY_VOLUMEDOWN) {
         int val = *value;
         pr_info("KEY_VOLUMEDOWN val: %d\n", val);
@@ -519,6 +535,7 @@ bool ksu_is_safe_mode()
     return false;
 }
 
+#ifdef CONFIG_KSU_KPROBES_HOOK
 void ksu_execve_hook_ksud(const struct pt_regs *regs)
 {
     const char __user **filename_user = (const char **)&PT_REGS_PARM1(regs);
@@ -621,6 +638,202 @@ static void stop_init_rc_hook()
     pr_info("unregister init_rc syscall hook\n");
 }
 
+static void stop_input_hook(void)
+{
+    bool ret = schedule_work(&stop_input_hook_work);
+    pr_info("unregister input kprobe: %d!\n", ret);
+}
+#else // manual hook, no kprobes
+
+static void vol_detector_event(struct input_handle *handle, unsigned int type, unsigned int code, int value)
+{
+    if (!value)
+        return;
+
+    if (type != EV_KEY)
+        return;
+
+    if (code != KEY_VOLUMEDOWN)
+        return;
+
+    pr_info("KEY_VOLUMEDOWN press detected!\n");
+
+    volumedown_pressed_count += 1;
+    pr_info("volumedown_pressed_count: %d\n", volumedown_pressed_count);
+
+    // yeah this fucks up, seems unreg in the same context is an issue
+    // but then again, tehres no need to unreg here, just let on_post_fs_data do it
+    //if (volume_pressed_count >= 3) {
+    //	pr_info("KEY_VOLUMEDOWN pressed max times, safe mode detected!\n");
+    //	ksu_stop_input_hook_runtime();
+    //}
+}
+
+static int vol_detector_connect(struct input_handler *handler, struct input_dev *dev, const struct input_device_id *id)
+{
+    struct input_handle *handle;
+    int error;
+
+    handle = kzalloc(sizeof(struct input_handle), GFP_KERNEL);
+    if (!handle)
+        return -ENOMEM;
+
+    handle->dev = dev;
+    handle->handler = handler;
+    handle->name = "ksu_handle_input";
+
+    error = input_register_handle(handle);
+    if (error)
+        goto err_free_handle;
+
+    error = input_open_device(handle);
+    if (error)
+        goto err_unregister_handle;
+
+    return 0;
+
+err_unregister_handle:
+    input_unregister_handle(handle);
+err_free_handle:
+    kfree(handle);
+    return error;
+}
+
+static const struct input_device_id vol_detector_ids[] = {
+    {
+        .flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_KEYBIT,
+        .evbit = { BIT_MASK(EV_KEY) },
+        .keybit = { [BIT_WORD(KEY_VOLUMEDOWN)] = BIT_MASK(KEY_VOLUMEDOWN) },
+    },
+    {}
+};
+
+static void vol_detector_disconnect(struct input_handle *handle)
+{
+    input_close_device(handle);
+    input_unregister_handle(handle);
+    kfree(handle);
+}
+
+MODULE_DEVICE_TABLE(input, vol_detector_ids);
+
+static struct input_handler vol_detector_handler = {
+    .event = vol_detector_event,
+    .connect = vol_detector_connect,
+    .disconnect = vol_detector_disconnect,
+    .name = "ksu",
+    .id_table = vol_detector_ids,
+};
+
+static int vol_detector_init()
+{
+    pr_info("vol_detector: init\n");
+    return input_register_handler(&vol_detector_handler);
+}
+
+static void vol_detector_exit()
+{
+    pr_info("vol_detector: exit\n");
+    input_unregister_handler(&vol_detector_handler);
+}
+
+// NOTE: https://github.com/tiann/KernelSU/commit/df640917d11dd0eff1b34ea53ec3c0dc49667002
+// - added 260110, seems needed for A16 QPR 3
+
+typedef enum {
+    STAT_NATIVE, // struct stat
+    STAT_COMPAT, // struct compat_stat
+    STAT_STAT64 // struct stat64 // 32-bit uses this
+} stat_type_t;
+
+static __always_inline void ksu_common_newfstat_ret(unsigned long fd_long, void **statbuf_ptr, const int type)
+{
+    if (!is_init(current_cred()))
+        return;
+
+    struct file *file = fget(fd_long);
+    if (!file)
+        return;
+
+    if (!is_init_rc(file)) {
+        fput(file);
+        return;
+    }
+    fput(file);
+
+    pr_info("%s: stat init.rc \n", __func__);
+
+    uintptr_t statbuf_ptr_local = (uintptr_t) * (void **)statbuf_ptr;
+    void __user *statbuf = (void __user *)statbuf_ptr_local;
+    if (!statbuf)
+        return;
+
+    void __user *st_size_ptr;
+    long size, new_size;
+    size_t len;
+
+    st_size_ptr = statbuf + offsetof(struct stat, st_size);
+    len = sizeof(long);
+
+#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
+    if (type) {
+        st_size_ptr = statbuf + offsetof(struct stat64, st_size);
+        len = sizeof(long long);
+    }
+#endif
+
+    if (copy_from_user(&size, st_size_ptr, len)) {
+        pr_info("%s: read statbuf 0x%lx failed \n", __func__, (unsigned long)st_size_ptr);
+        return;
+    }
+
+    new_size = size + ksu_rc_len;
+	pr_info("%s: adding ksu_rc_len: %ld -> %ld \n", __func__, size, new_size);
+
+	if (!copy_to_user(st_size_ptr, &new_size, len))
+		pr_info("%s: added ksu_rc_len \n", __func__);
+	else
+		pr_info("%s: add ksu_rc_len failed: statbuf 0x%lx \n", __func__, (unsigned long)st_size_ptr);
+
+	return;
+}
+
+void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr)
+{
+    unsigned long fd_long = (unsigned long)*fd;
+
+    // native
+    ksu_common_newfstat_ret(fd_long, (void **)statbuf_ptr, STAT_NATIVE);
+}
+
+#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
+void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr)
+{
+    unsigned long fd_long = (unsigned long)*fd;
+
+    // 32-bit call uses this!
+    ksu_common_newfstat_ret(fd_long, (void **)statbuf_ptr, STAT_STAT64);
+}
+#endif
+
+static inline void stop_input_hook(void)
+{
+    ksu_input_hook = false;
+    vol_detector_exit();
+}
+
+static void stop_init_rc_hook(void)
+{
+    ksu_init_rc_hook = false;
+    pr_info("stop init_rc_hook!\n");
+}
+
+void ksu_stop_ksud_execve_hook(void)
+{
+    ksud_execve_key = false;
+}
+#endif
+
 void ksu_stop_input_hook_runtime(void)
 {
     static bool input_hook_stopped = false;
@@ -628,13 +841,13 @@ void ksu_stop_input_hook_runtime(void)
         return;
     }
     input_hook_stopped = true;
-    bool ret = schedule_work(&stop_input_hook_work);
-    pr_info("unregister input kprobe: %d!\n", ret);
+    stop_input_hook();
 }
 
 // ksud: module support
 void __init ksu_ksud_init()
 {
+#ifdef CONFIG_KSU_KPROBES_HOOK
     int ret;
 
     ksu_syscall_table_hook(__NR_read, ksu_sys_read, &orig_sys_read);
@@ -644,16 +857,25 @@ void __init ksu_ksud_init()
     pr_info("ksud: input_event_kp: %d\n", ret);
 
     INIT_WORK(&stop_input_hook_work, do_stop_input_hook);
+#endif
+#ifdef CONFIG_KSU_MANUAL_HOOK
+    vol_detector_init();
+#endif
 }
 
 void __exit ksu_ksud_exit()
 {
-    // TODO:
-    // this should be done before unregister vfs_read_kp
-    // stop_init_rc_hook();
-    unregister_kprobe(&input_event_kp);
+#ifdef CONFIG_KSU_KPROBES_HOOK
+	// TODO:
+	// this should be done before unregister vfs_read_kp
+	// stop_init_rc_hook();
+	unregister_kprobe(&input_event_kp);
+#endif
+#ifdef CONFIG_KSU_MANUAL_HOOK
+	vol_detector_exit();
+#endif
 
-    if (module_rc_buf) {
-        free_module_rc();
-    }
+	if (module_rc_buf) {
+		free_module_rc();
+	}
 }

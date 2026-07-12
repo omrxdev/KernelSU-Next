@@ -12,7 +12,10 @@
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
 #include <linux/compiler_types.h>
+#endif
 #include <linux/hashtable.h>
 #include <linux/kref.h>
 
@@ -23,6 +26,7 @@
 #include "policy/allowlist.h"
 #include "manager/manager_identity.h"
 #include "infra/su_mount_ns.h"
+#include "compat/kernel_compat.h"
 
 #define FILE_MAGIC 0x7f4b5355 // ' KSU', u32
 #define FILE_FORMAT_VERSION 4 // u32
@@ -433,12 +437,12 @@ static void do_persistent_allow_list(struct callback_head *_cb)
     }
 
 	// store magic and version
-	if (kernel_write(fp, &magic, sizeof(magic), &off) != sizeof(magic)) {
+	if (ksu_kernel_write_compat(fp, &magic, sizeof(magic), &off) != sizeof(magic)) {
 		pr_err("save_allow_list write magic failed.\n");
 		goto close_file;
 	}
 
-	if (kernel_write(fp, &version, sizeof(version), &off) != sizeof(version)) {
+	if (ksu_kernel_write_compat(fp, &version, sizeof(version), &off) != sizeof(version)) {
 		pr_err("save_allow_list write version failed.\n");
 		goto close_file;
 	}
@@ -448,7 +452,7 @@ static void do_persistent_allow_list(struct callback_head *_cb)
         pr_info("save allow list, name: %s uid :%d, allow: %d\n", p->profile.key, p->profile.curr_uid,
                 p->profile.allow_su);
 
-        kernel_write(fp, &p->profile, sizeof(p->profile), &off);
+        ksu_kernel_write_compat(fp, &p->profile, sizeof(p->profile), &off);
     }
     mutex_unlock(&allowlist_mutex);
 
@@ -535,14 +539,13 @@ void ksu_load_allow_list()
 	}
 
 	// verify magic
-	if (kernel_read(fp, &magic, sizeof(magic), &off) != sizeof(magic) ||
+	if (ksu_kernel_read_compat(fp, &magic, sizeof(magic), &off) != sizeof(magic) ||
 	    magic != FILE_MAGIC) {
 		pr_err("allowlist file invalid: %d!\n", magic);
 		goto exit;
 	}
 
-	// get file version
-	if (kernel_read(fp, &version, sizeof(version), &off) != sizeof(version)) {
+	if (ksu_kernel_read_compat(fp, &version, sizeof(version), &off) != sizeof(version)) {
 		pr_err("allowlist read version: %d failed\n", version);
 		goto exit;
 	}
@@ -560,7 +563,7 @@ void ksu_load_allow_list()
 	while (true) {
 		struct app_profile profile;
 
-		ret = kernel_read(fp, &profile, app_profile_size, &off);
+		ret = ksu_kernel_read_compat(fp, &profile, app_profile_size, &off);
 
 		if (ret != app_profile_size) {
 			if (ret != 0)

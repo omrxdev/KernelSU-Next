@@ -1,17 +1,27 @@
-#include "linux/file.h"
-#include "linux/namei.h"
+#include <linux/file.h>
+#include <linux/namei.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
 #include <linux/compiler_types.h>
+#endif
 #include <linux/preempt.h>
 #include <linux/printk.h>
 #include <linux/mm.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 #include <linux/pgtable.h>
+#else
+#include <asm/pgtable.h>
+#endif
 #include <linux/uaccess.h>
 #include <asm/current.h>
 #include <linux/cred.h>
 #include <linux/fs.h>
 #include <linux/types.h>
-#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 #include <linux/sched/task_stack.h>
+#else
+#include <linux/sched.h>
+#endif
 #include <linux/ptrace.h>
 
 #include "arch.h"
@@ -21,7 +31,13 @@
 #include "runtime/ksud.h"
 #include "feature/sucompat.h"
 #include "policy/app_profile.h"
+#include "selinux/selinux.h"
+#include "compat/kernel_compat.h"
+#ifdef CONFIG_KSU_KPROBES_HOOK
 #include "hook/syscall_hook.h"
+#else
+#include "feature/adb_root.h"
+#endif
 #include "sulog/event.h"
 #include "ksu.h"
 #include "util.h"
@@ -52,6 +68,9 @@ static const struct ksu_feature_handler su_compat_handler = {
 	.set_handler = su_compat_feature_set,
 };
 
+#ifdef CONFIG_KSU_KPROBES_HOOK
+static const char su_path[] = SU_PATH;
+
 static void __user *userspace_stack_buffer(const void *d, size_t len)
 {
 	// To avoid having to mmap a page in userspace, just write below the stack
@@ -72,8 +91,6 @@ static char __user *empty_user_path(void)
 {
 	return userspace_stack_buffer("", sizeof(""));
 }
-
-static const char su_path[] = SU_PATH;
 
 static bool is_ksud_exists()
 {
@@ -243,6 +260,86 @@ long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, 
 do_orig_execve:
 	return ksu_syscall_table[orig_nr](regs);
 }
+
+#else // CONFIG_KSU_MANUAL_HOOK
+
+extern bool ksud_execve_key;
+
+static inline int do_ksu_handle_execveat_sucompat(int *fd, const char *filename, void *argv)
+{
+	struct path kpath;
+	bool is_allowed = ksu_is_allow_uid_for_current(current_uid().val);
+
+	(void)fd;
+	(void)argv;
+
+	if (!ksu_su_compat_enabled)
+		return 0;
+	if (!is_allowed)
+		return 0;
+	if (likely(memcmp(filename, SU_PATH, sizeof(SU_PATH))))
+		return 0;
+
+	ksu_compat_sulog('x');
+	pr_info("do_execveat_common su found\n");
+	escape_with_root_profile();
+
+	if (kern_path(KSUD_PATH, LOOKUP_FOLLOW, &kpath)) {
+		pr_info("sucompat: /data/adb/ksud not found, fallback to /system/bin/sh");
+		memcpy((void *)filename, SH_PATH, sizeof(SH_PATH));
+	} else {
+		path_put(&kpath);
+		memcpy((void *)filename, KSUD_PATH, sizeof(KSUD_PATH));
+	}
+
+	return 0;
+}
+
+int ksu_handle_execve(int *fd, const char *filename, void *argv, void *envp, int *flags)
+{
+	long ret;
+
+	(void)flags;
+
+	if (current->pid != 1 && is_init(current_cred())) {
+		if (unlikely(strcmp(filename, KSUD_PATH) == 0)) {
+			pr_info("hook_manager: escape to root for init executing ksud\n");
+			escape_to_root_for_init();
+		}
+
+		ret = ksu_adb_root_handle_execve(filename, (struct user_arg_ptr *)envp);
+		if (ret)
+			pr_err("adb root failed: %ld\n", ret);
+	}
+
+	if (unlikely(ksud_execve_key)) {
+		ksu_handle_execveat_ksud(filename, (struct user_arg_ptr *)argv);
+	}
+
+	if (current_uid().val == 0) {
+		ksu_compat_sulog('x');
+	}
+
+	return do_ksu_handle_execveat_sucompat(fd, filename, argv);
+}
+
+int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
+{
+	if (IS_ERR(*filename_ptr))
+		return 0;
+
+	return ksu_handle_execve(fd, (*filename_ptr)->name, argv, envp, flags);
+}
+
+int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+				 void *__never_use_argv, void *__never_use_envp,
+				 int *__never_use_flags)
+{
+	return ksu_handle_execveat(fd, filename_ptr, __never_use_argv, __never_use_envp,
+				   __never_use_flags);
+}
+
+#endif // CONFIG_KSU_MANUAL_HOOK
 
 // sucompat: permitted process can execute 'su' to gain root access.
 void __init ksu_sucompat_init()

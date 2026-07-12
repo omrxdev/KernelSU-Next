@@ -21,15 +21,14 @@ struct watch_dir {
 
 static struct fsnotify_group *g;
 
-static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask,
-                                  struct inode *inode, struct inode *dir,
-                                  const struct qstr *file_name, u32 cookie)
+#include "pkg_observer_defs.h" // KSU_DECL_FSNOTIFY_OPS
+static KSU_DECL_FSNOTIFY_OPS(ksu_handle_inode_event)
 {
     if (!file_name)
         return 0;
     if (mask & FS_ISDIR)
         return 0;
-    if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
+    if (ksu_fname_len(file_name) == 13 && !memcmp(ksu_fname_arg(file_name), "packages.list", 13)) {
         pr_info("packages.list detected: %d\n", mask);
         track_throne(false);
     }
@@ -37,7 +36,11 @@ static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask,
 }
 
 static const struct fsnotify_ops ksu_ops = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
 	.handle_inode_event = ksu_handle_inode_event,
+#else
+	.handle_event = ksu_handle_inode_event,
+#endif
 };
 
 static int add_mark_on_inode(struct inode *inode, u32 mask,

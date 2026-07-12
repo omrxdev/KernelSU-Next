@@ -134,8 +134,12 @@ void __init ksu_syscall_hook_manager_init(void)
     // Register syscall hooks via dispatcher
     ksu_register_syscall_hook(__NR_setresuid, ksu_hook_setresuid);
     ksu_register_syscall_hook(__NR_execve, ksu_hook_execve);
+#ifdef __NR_newfstatat
     ksu_register_syscall_hook(__NR_newfstatat, ksu_hook_newfstatat);
+#endif
+#ifdef __NR_faccessat
     ksu_register_syscall_hook(__NR_faccessat, ksu_hook_faccessat);
+#endif
 
 #ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
     ret = register_trace_sys_enter(ksu_sys_enter_handler, NULL);
@@ -170,8 +174,12 @@ void __exit ksu_syscall_hook_manager_exit(void)
 
     ksu_unregister_syscall_hook(__NR_setresuid);
     ksu_unregister_syscall_hook(__NR_execve);
+#ifdef __NR_newfstatat
     ksu_unregister_syscall_hook(__NR_newfstatat);
+#endif
+#ifdef __NR_faccessat
     ksu_unregister_syscall_hook(__NR_faccessat);
+#endif
 
     ksu_syscall_hook_exit();
 

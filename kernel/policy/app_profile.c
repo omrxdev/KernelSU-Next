@@ -1,13 +1,16 @@
 #include <linux/capability.h>
 #include <linux/cred.h>
 #include <linux/sched.h>
-#include <linux/sched/user.h>
-#include <linux/sched/signal.h>
 #include <linux/seccomp.h>
 #include <linux/slab.h>
 #include <linux/thread_info.h>
 #include <linux/uidgid.h>
 #include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+// https://github.com/torvalds/linux/commit/8703e8a465b1e9cadc3680b4b1248f5987e54518
+#include <linux/sched/user.h>
+#include <linux/sched/task.h>
+#endif
 
 #include "policy/allowlist.h"
 #include "policy/app_profile.h"
@@ -63,34 +66,49 @@ void setup_groups(struct root_profile *profile, struct cred *cred)
 
 void seccomp_filter_release(struct task_struct *tsk);
 
-static void disable_seccomp(void)
+// https://github.com/rsuntk/KernelSU/blob/af9072e19d125a94797ae3c473e7e94c3d8c1bcc/kernel/app_profile.c#L79
+void disable_seccomp(void)
 {
-    struct task_struct *fake;
-
-    fake = kmalloc(sizeof(*fake), GFP_KERNEL);
-    if (!fake) {
-        pr_warn("failed to alloc fake task_struct\n");
+    // https://github.com/backslashxx/KernelSU/tree/e28930645e764b9f0e5d0d1b0d5e236464939075/kernel/app_profile.c
+    if (!current->seccomp.mode) {
         return;
     }
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0) || defined(KSU_OPTIONAL_SECCOMP_FILTER_RELEASE))
+    struct task_struct *fake;
+    fake = kmalloc(sizeof(*fake), GFP_ATOMIC);
+    if (!fake) {
+        pr_err("%s: cannot allocate fake struct!\n", __func__);
+        return;
+    }
+#endif
 
     // Refer to kernel/seccomp.c: seccomp_set_mode_strict
     // When disabling Seccomp, ensure that current->sighand->siglock is held during the operation.
     spin_lock_irq(&current->sighand->siglock);
     // disable seccomp
-#if defined(CONFIG_GENERIC_ENTRY) &&                                           \
-    LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+#if defined(CONFIG_GENERIC_ENTRY) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
     clear_syscall_work(SECCOMP);
 #else
     clear_thread_flag(TIF_SECCOMP);
 #endif
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0) || defined(KSU_OPTIONAL_SECCOMP_FILTER_RELEASE))
     memcpy(fake, current, sizeof(*fake));
 
+#endif
     current->seccomp.mode = 0;
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0) && !defined(KSU_OPTIONAL_SECCOMP_FILTER_RELEASE))
+    // put_seccomp_filter is allowed while we holding sighand
+    put_seccomp_filter(current);
+#endif
     current->seccomp.filter = NULL;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0) || defined(KSU_OPTIONAL_SECCOMP_FILTER_CNT))
     atomic_set(&current->seccomp.filter_count, 0);
+#endif
     spin_unlock_irq(&current->sighand->siglock);
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0) || defined(KSU_OPTIONAL_SECCOMP_FILTER_RELEASE))
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
     // https://github.com/torvalds/linux/commit/bfafe5efa9754ebc991750da0bcca2a6694f3ed3#diff-45eb79a57536d8eccfc1436932f093eb5c0b60d9361c39edb46581ad313e8987R576-R577
     fake->flags |= PF_EXITING;
@@ -98,9 +116,9 @@ static void disable_seccomp(void)
     // https://github.com/torvalds/linux/commit/0d8315dddd2899f519fe1ca3d4d5cdaf44ea421e#diff-45eb79a57536d8eccfc1436932f093eb5c0b60d9361c39edb46581ad313e8987R556-R558
     fake->sighand = NULL;
 #endif
-
     seccomp_filter_release(fake);
     kfree(fake);
+#endif
 }
 
 int escape_with_root_profile(void)
@@ -183,13 +201,15 @@ int escape_with_root_profile(void)
 
     disable_seccomp();
 
-    if (profile->flags & FLAG_KSU_NO_NEW_PRIVS) {
-        set_thread_flag(TIF_KSU_DISABLE_ESCAPE_WITH_ROOT);
-    }
+#ifdef CONFIG_KSU_KPROBES_HOOK
+	if (profile->flags & FLAG_KSU_NO_NEW_PRIVS) {
+		set_thread_flag(TIF_KSU_DISABLE_ESCAPE_WITH_ROOT);
+	}
 
     for_each_thread (p, t) {
         ksu_set_task_tracepoint_flag(t);
     }
+#endif
 
     setup_mount_ns(profile->namespaces);
     ksu_put_root_profile(profile);
