@@ -104,6 +104,7 @@ out_unlock:
 	return status;
 }
 
+
 void ksu_add_probe_to_list(u32 cmd, const char *args[])
 {
 	if (!args || !args[0])
@@ -348,6 +349,54 @@ extern struct selinux_state selinux_state;
 #else
 #define ksu_selinux_kernel_status_page() selinux_kernel_status_page()
 #endif
+static u32 ksu_hidden_reload_count = 0; /* # of KSU-caused reloads we've suppressed */
+static DEFINE_SPINLOCK(fake_status_sync_lock);
+
+void ksu_hide_notify_reload(bool ksu_triggered)
+{
+	struct page *real_page = ksu_selinux_kernel_status_page();
+	struct page *fp = smp_load_acquire(&fake_status);
+	if (!real_page || !fp)
+		return;
+
+	struct selinux_kernel_status *real = page_address(real_page);
+	struct selinux_kernel_status *fake = page_address(fp);
+
+	spin_lock(&fake_status_sync_lock);
+
+	if (ksu_triggered) {
+		/* our own reload just happened on the real page; don't
+		 * reflect it on the fake page, just remember we owe an offset */
+		ksu_hidden_reload_count++;
+		spin_unlock(&fake_status_sync_lock);
+		return;
+	}
+
+	/* external reload: catch fake up to real, minus what we've hidden */
+	fake->policyload = real->policyload - ksu_hidden_reload_count;
+	fake->sequence   = real->sequence - (ksu_hidden_reload_count * 2);
+	fake->enforcing  = real->enforcing;
+
+	spin_unlock(&fake_status_sync_lock);
+}
+
+static int ksu_status_poll_thread(void *data)
+{
+	u32 last_seen_policyload = 0;
+
+	while (!kthread_should_stop()) {
+		struct page *real_page = ksu_selinux_kernel_status_page();
+		if (real_page) {
+			struct selinux_kernel_status *real = page_address(real_page);
+			if (real->policyload != last_seen_policyload) {
+				last_seen_policyload = real->policyload;
+				ksu_hide_notify_reload(false); /* treat as external, sync fake */
+			}
+		}
+		msleep(2000);
+	}
+	return 0;
+}
 
 static void initialize_fake_status(void)
 {
@@ -622,8 +671,8 @@ void __init ksu_selinux_hide_init(void)
 	if (ksu_register_feature_handler(&selinux_hide_status_handler))
 		pr_err("ksu_selinux_hide: failed to register feature handler\n");
 
-	ksu_add_probe_to_list(cmd, KERNEL_SU_DOMAIN("ksu"));
-	ksu_add_probe_to_list(cmd, KERNEL_SU_FILE("ksu_file"));
+	ksu_add_probe_to_list(KSU_SEPOLICY_CMD_TYPE, (const char *[]){ KERNEL_SU_DOMAIN, NULL });
+	ksu_add_probe_to_list(KSU_SEPOLICY_CMD_TYPE, (const char *[]){ KERNEL_SU_FILE, NULL });
 	kthread_run(ksu_hide_init_thread, NULL, "ksu_selinux_hide_init");
 }
 

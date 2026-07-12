@@ -22,5 +22,6 @@ extern size_t ksu_hide_rule_len;
 extern struct mutex selinux_hide_list_mutex;
 
 void ksu_add_probe_to_list(u32 cmd, const char *args[]);
+void ksu_hide_notify_reload(bool ksu_triggered);
 
 #endif

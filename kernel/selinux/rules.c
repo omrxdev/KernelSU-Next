@@ -217,6 +217,8 @@ void apply_kernelsu_rules()
 	synchronize_rcu();
 	ksu_destroy_sepolicy(old_pol);
 
+    ksu_hide_notify_reload();
+
 	reset_avc_cache();
 out_unlock:
 	mutex_unlock(&selinux_state.policy_mutex);
@@ -645,6 +647,8 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
 	rcu_assign_pointer(selinux_state.policy, pol);
 	synchronize_rcu();
 	ksu_destroy_sepolicy(old_pol);
+
+    ksu_hide_notify_reload();
 
 	reset_avc_cache();
 	ret = success_cmd_count;
