@@ -36,9 +36,10 @@ int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
 {
 	ksu_handle_execveat_ksud(fd, filename_ptr, argv, envp, flags);
 	// adb_root must run even after the ksud execve hook is torn down
-    if (filename_ptr && !IS_ERR(*filename_ptr))
+    if (filename_ptr && !IS_ERR(*filename_ptr)) {
         ksu_adb_root_handle_execve((*filename_ptr)->name,
                                    (struct user_arg_ptr *)envp);
+	}
 	return ksu_handle_execveat_sucompat(fd, filename_ptr, argv, envp,
 					    flags);
 }
