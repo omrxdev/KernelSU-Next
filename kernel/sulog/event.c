@@ -14,6 +14,7 @@
 #include "infra/event_queue.h"
 #include "klog.h" // IWYU pragma: keep
 #include "sulog/event.h"
+#include "compat/kernel_compat.h"
 
 #define KSU_SULOG_MAX_QUEUED 256U
 #define KSU_SULOG_MAX_PAYLOAD_LEN 2048U
